@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -113,6 +113,7 @@ namespace ImageSelector
                 {
                     settings.CacheSize = cacheSize;
                     updateCacheSize(settings.CacheSize);
+                    settings.Save();
                 }
             }
             else
@@ -168,6 +169,7 @@ namespace ImageSelector
             
             currentDirectory = directory; // 更新当前目录
             settings.LastPath = directory; //更新设置中的LastPath
+            settings.Save();
             imageFiles = GetImageFiles(directory);
             if (imageFiles.Any())
             {

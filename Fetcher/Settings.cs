@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Windows.Media;
 using System.Xml.Serialization;
@@ -123,8 +123,12 @@ namespace ImageSelector
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "ImageViewer",
             "settings.xml");
-            
-        // 保存设置
+
+        private static string BackupPath => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "ImageViewer",
+            "settings_backup.xml");
+
         public void Save()
         {
             try
@@ -132,33 +136,61 @@ namespace ImageSelector
                 string directory = Path.GetDirectoryName(SettingsPath);
                 if (!Directory.Exists(directory))
                     Directory.CreateDirectory(directory);
-                    
+
+                if (File.Exists(SettingsPath))
+                {
+                    try
+                    {
+                        File.Copy(SettingsPath, BackupPath, true);
+                    }
+                    catch { }
+                }
+
                 XmlSerializer serializer = new XmlSerializer(typeof(AppSettings));
                 using (FileStream stream = new FileStream(SettingsPath, FileMode.Create))
                 {
                     serializer.Serialize(stream, this);
                 }
             }
-            catch { /* 忽略保存错误 */ }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error saving settings: {ex.Message}");
+            }
         }
-        
-        // 加载设置
+
         public static AppSettings Load()
         {
             if (!File.Exists(SettingsPath))
+            {
+                if (File.Exists(BackupPath))
+                {
+                    return LoadFromFile(BackupPath);
+                }
                 return new AppSettings();
-                
+            }
+
+            var result = LoadFromFile(SettingsPath);
+            if (result == null && File.Exists(BackupPath))
+            {
+                return LoadFromFile(BackupPath);
+            }
+            return result ?? new AppSettings();
+        }
+
+        private static AppSettings LoadFromFile(string path)
+        {
             try
             {
                 XmlSerializer serializer = new XmlSerializer(typeof(AppSettings));
-                using (FileStream stream = new FileStream(SettingsPath, FileMode.Open))
+                using (FileStream stream = new FileStream(path, FileMode.Open))
                 {
                     return (AppSettings)serializer.Deserialize(stream);
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                return new AppSettings();
+                Console.WriteLine($"Error loading settings from {path}: {ex.Message}");
+                return null;
             }
         }
     }
