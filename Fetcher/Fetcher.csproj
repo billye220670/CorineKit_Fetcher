@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
         <OutputType>WinExe</OutputType>
@@ -7,6 +7,12 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <UseWPF>true</UseWPF>
         <ApplicationIcon>FetcherIcon.ico</ApplicationIcon>
+        <Version>1.0.2</Version>
+        <AssemblyVersion>1.0.2.0</AssemblyVersion>
+        <FileVersion>1.0.2.0</FileVersion>
+        <PackageId>CorineKitFetcher</PackageId>
+        <Authors>billye220670</Authors>
+        <Description>WPF-based image random selection tool</Description>
     </PropertyGroup>
 
 </Project>

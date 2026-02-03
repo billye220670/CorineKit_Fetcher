@@ -26,6 +26,7 @@ namespace ImageSelector
         private int viewedIndex = -1; // 当前查看的图片在缓存中的索引
         private string currentDirectory; // 当前目录路径
         private string currentImagePath; // 当前图片路径
+        private bool isMouseOverCurrentPathButton; // 鼠标是否悬停在当前目录按钮上
         // 应用设置
         public AppSettings settings;
         
@@ -166,7 +167,7 @@ namespace ImageSelector
 
         private void LoadImagesFromDirectory(string directory)
         {
-            
+
             currentDirectory = directory; // 更新当前目录
             settings.LastPath = directory; //更新设置中的LastPath
             settings.Save();
@@ -176,6 +177,7 @@ namespace ImageSelector
                 UpdateHintVisibility(); // 更新提示信息的可见性
                 UpdatePathButtons(directory, null); //根据当前目录更新路径按钮，并且不显示文件名
                 LoadRandomImage(); // 初始化显示随机图片
+                BuildDirectoryIndex(); // 必须在LoadRandomImage之后调用，以便currentIndex已被设置
             }
             else
             {
@@ -212,6 +214,21 @@ namespace ImageSelector
             currentImagePath = imagePath; // 更新当前图片路径
             UpdatePathButtons(Path.GetDirectoryName(imagePath), Path.GetFileName(imagePath)); // 更新路径按钮
 
+            // 更新currentIndex以匹配当前显示的图片
+            int newIndex = imageFiles.IndexOf(imagePath);
+            if (newIndex >= 0)
+            {
+                currentIndex = newIndex;
+
+                // 更新当前目录的起始和结束索引
+                string currentDir = Path.GetDirectoryName(imagePath);
+                if (directoryImageIndices.TryGetValue(currentDir, out var indices))
+                {
+                    currentDirStartIndex = indices.First();
+                    currentDirEndIndex = indices.Last();
+                }
+            }
+
             // 显示图片
             BitmapImage bitmap = new BitmapImage();
             bitmap.BeginInit();
@@ -221,7 +238,7 @@ namespace ImageSelector
 
             // 计算适合窗口的缩放比例
             ScaleImageToFit(bitmap);
-    
+
             if (!viewedImages.Contains(imagePath)) // 仅在缓存中不包含当前图片时添加
             {
                 CacheImage(imagePath);
@@ -299,6 +316,7 @@ namespace ImageSelector
 
         private void UpdatePathButtons(string directory, string filename)
         {
+            isMouseOverCurrentPathButton = false;
             PathButtonPanel.Children.Clear(); // 清空现有按钮
 
             // 按路径分割为部分
@@ -309,6 +327,8 @@ namespace ImageSelector
             {
                 var part = pathParts[i];
                 currentPath = Path.Combine(currentPath, part); // 构建每一部分的完整路径
+                bool isCurrentDirButton = string.Equals(currentPath, currentDirectory, StringComparison.InvariantCultureIgnoreCase);
+
                 Button pathButton = new Button
                 {
                     Focusable = false,
@@ -316,22 +336,19 @@ namespace ImageSelector
                     Margin = new Thickness(2),
                     Padding = new Thickness(12),
                     Tag = currentPath, // 将当前路径作为按钮的 Tag 属性
-                     
                 };
-                pathButton.MouseRightButtonDown += PathButton_MouseRightButtonDown;
-                pathButton.Background = new SolidColorBrush(settings.GetButtonColorFromPresetID());
-                pathButton.Foreground = new SolidColorBrush(settings.GetForegroundColorFromPresetID());
-                // 设置悬停提示，使用当前语言设置
-                pathButton.ToolTip = LanguageResources.GetText("PathButtonTooltip", settings.CurrentLanguage);
 
-                // 检查当前路径是否与 fullPath 相同，以决定高亮
-                if (string.Equals(currentPath, currentDirectory, StringComparison.InvariantCultureIgnoreCase))
+                if (isCurrentDirButton)
                 {
-                    pathButton.Background = new SolidColorBrush(Color.FromRgb(0, 74, 230)); // 高亮背景色
-                    pathButton.Foreground = new SolidColorBrush(Colors.White); // 设置文字颜色
+                    pathButton.MouseEnter += (s, e) => { isMouseOverCurrentPathButton = true; };
+                    pathButton.MouseLeave += (s, e) => { isMouseOverCurrentPathButton = false; };
                 }
 
-                pathButton.Click += PathButton_Click; // 绑定按钮点击事件
+                pathButton.MouseRightButtonDown += PathButton_MouseRightButtonDown;
+                pathButton.Background = new SolidColorBrush(isCurrentDirButton ? Color.FromRgb(0, 74, 230) : settings.GetButtonColorFromPresetID());
+                pathButton.Foreground = new SolidColorBrush(isCurrentDirButton ? Colors.White : settings.GetForegroundColorFromPresetID());
+                pathButton.ToolTip = LanguageResources.GetText("PathButtonTooltip", settings.CurrentLanguage);
+                pathButton.Click += PathButton_Click;
                 PathButtonPanel.Children.Add(pathButton);
             }
 
@@ -348,19 +365,8 @@ namespace ImageSelector
                 };
                 fileButton.Background = new SolidColorBrush(settings.GetButtonColorFromPresetID());
                 fileButton.Foreground = new SolidColorBrush(settings.GetForegroundColorFromPresetID());
-                
-                // 设置悬停提示，使用当前语言设置
                 fileButton.ToolTip = LanguageResources.GetText("FileButtonTooltip", settings.CurrentLanguage);
-
-                // 检查文件按钮的 Tag 是否与 currentImagePath 相同，以决定高亮
-                if (string.Equals(currentImagePath, currentDirectory, StringComparison.InvariantCultureIgnoreCase))
-                {
-                    fileButton.Background = new SolidColorBrush(Colors.LightBlue); // 高亮背景色
-                    fileButton.Foreground = new SolidColorBrush(Colors.White); // 设置文字颜色
-                    
-                }
-
-                fileButton.Click += FileButton_Click; // 绑定按钮点击事件
+                fileButton.Click += FileButton_Click;
                 PathButtonPanel.Children.Add(fileButton);
             }
         }
@@ -511,60 +517,81 @@ namespace ImageSelector
                     break;
             }
         }
-        private bool IsMouseOverCurrentPathButton()
-        {
-            foreach (var child in PathButtonPanel.Children)
-            {
-                if (child is Button btn &&
-                    btn.Tag?.ToString() == currentDirectory &&
-                    btn.IsMouseOver)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
+        private bool IsMouseOverCurrentPathButton() => isMouseOverCurrentPathButton;
+
         private void Window_MouseWheel(object sender, MouseWheelEventArgs e)
         {
             if (e.Delta > 0) // 滚动向上，切换到上一张
             {
-                if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control || IsMouseOverCurrentPathButton() )
+                if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control || IsMouseOverCurrentPathButton())
                 {
-                    showPreviousImageInOrder(); // 如果按下了 Ctrl 键，则按顺序切换到上一张
+                    showPreviousImageInOrder();
                     return;
                 }
                 ShowPreviousImage();
             }
             else if (e.Delta < 0) // 滚动向下，切换到下一张
             {
-                if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control || IsMouseOverCurrentPathButton() )
+                if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control || IsMouseOverCurrentPathButton())
                 {
-                    showNextImageInOrder();// 如果按下了 Ctrl 键，则按顺序切换到下一张
+                    showNextImageInOrder();
                     return;
                 }
                 ShowNextImage();
             }
         }
 
+        private Dictionary<string, List<int>> directoryImageIndices = new Dictionary<string, List<int>>();
+        private int currentDirStartIndex;
+        private int currentDirEndIndex;
+
+        private void BuildDirectoryIndex()
+        {
+            directoryImageIndices.Clear();
+            for (int i = 0; i < imageFiles.Count; i++)
+            {
+                string dir = Path.GetDirectoryName(imageFiles[i]);
+                if (!directoryImageIndices.ContainsKey(dir))
+                    directoryImageIndices[dir] = new List<int>();
+                directoryImageIndices[dir].Add(i);
+            }
+
+            if (currentIndex >= 0 && currentIndex < imageFiles.Count)
+            {
+                string currentDir = Path.GetDirectoryName(imageFiles[currentIndex]);
+                if (directoryImageIndices.TryGetValue(currentDir, out var indices))
+                {
+                    currentDirStartIndex = indices.First();
+                    currentDirEndIndex = indices.Last();
+                }
+            }
+        }
+
         private void showNextImageInOrder()
         {
-            if (!imageFiles.Any()) return;
-            string currentPath = Path.GetDirectoryName(imageFiles[currentIndex]);
-            string targetPath = Path.GetDirectoryName(imageFiles[currentIndex+1]);
-            if (currentPath == targetPath)
+            if (!imageFiles.Any() || currentIndex < 0) return;
+
+            if (currentIndex < currentDirEndIndex)
             {
                 currentIndex++;
+            }
+            else if (currentIndex == currentDirEndIndex)
+            {
+                currentIndex = currentDirStartIndex;
             }
             DisplayImage(imageFiles[currentIndex]);
         }
         private void showPreviousImageInOrder()
         {
-            if (!imageFiles.Any()) return;
-            string currentPath = Path.GetDirectoryName(imageFiles[currentIndex]);
-            string targetPath = Path.GetDirectoryName(imageFiles[currentIndex-1]);
-            if (currentPath == targetPath)
+            if (!imageFiles.Any() || currentIndex < 0) return;
+
+            if (currentIndex > currentDirStartIndex)
             {
                 currentIndex--;
+            }
+            else if (currentIndex == currentDirStartIndex)
+            {
+                currentIndex = currentDirEndIndex;
             }
             DisplayImage(imageFiles[currentIndex]);
         }
