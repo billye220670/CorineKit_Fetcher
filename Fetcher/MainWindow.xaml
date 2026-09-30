@@ -4,9 +4,13 @@
         Title="抽選者Beta" Height="600" Width="800"
         Background="#F6F6F6"
         AllowDrop="True" Drop="Window_Drop"
-        MouseWheel="Window_MouseWheel"
+        PreviewMouseWheel="Window_PreviewMouseWheel"
+        PreviewMouseDown="Window_PreviewMouseDown"
+        PreviewMouseMove="Window_PreviewMouseMove"
+        PreviewMouseUp="Window_PreviewMouseUp"
+        LostMouseCapture="Window_LostMouseCapture"
         KeyDown="Window_KeyDown">
-    <Grid>
+    <Grid x:Name="RootGrid">
         <StackPanel Name="HintArea" VerticalAlignment="Center" HorizontalAlignment="Center">
             <TextBlock x:Name="HintTextBlock" 
                        Text="フォルダをここにドラッグ＆ドロップして開く" 
@@ -19,11 +23,16 @@
         <Image x:Name="RandomImage"
                HorizontalAlignment="Stretch"
                VerticalAlignment="Stretch" 
-               RenderTransformOrigin="0.5,0.5"
+               RenderTransformOrigin="0,0"
                MouseDown="RandomImage_MouseDown"
                MouseMove="Window_MouseMove">
+            <!-- 画布变换：先缩放后平移，即 屏幕点 = 布局点 * Scale + Translate。
+                 RenderTransformOrigin 必须是 0,0，缩放锚点由代码按鼠标位置换算。 -->
             <Image.RenderTransform>
-                <TranslateTransform x:Name="ImageTranslateTransform" />
+                <TransformGroup>
+                    <ScaleTransform x:Name="CanvasScaleTransform" ScaleX="1" ScaleY="1" />
+                    <TranslateTransform x:Name="CanvasTranslateTransform" X="0" Y="0" />
+                </TransformGroup>
             </Image.RenderTransform>
         </Image>
         <StackPanel x:Name="SettingsPanel" Visibility="Collapsed" Background="#F9F9F9" 
@@ -67,8 +76,9 @@
             </StackPanel>
             
         </Canvas>
+        <!-- 圆点指示器常驻窗口底部，加载出图片后一直显示 -->
         <StackPanel x:Name="IndicatorPanel" Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="10" Visibility="Hidden">
-            <!-- 圆点将会在这里动���添加 -->
+            <!-- 圆点在这里动态生成 -->
         </StackPanel>
     </Grid>
 </Window>

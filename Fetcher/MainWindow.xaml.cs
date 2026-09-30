@@ -26,7 +26,21 @@ namespace ImageSelector
         private int viewedIndex = -1; // 当前查看的图片在缓存中的索引
         private string currentDirectory; // 当前目录路径
         private string currentImagePath; // 当前图片路径
-        private bool isMouseOverCurrentPathButton; // 鼠标是否悬停在当前目录按钮上
+
+        // 全覆盖随机遍历引擎：按轮发放，保证每张图片都被抽到且不重复
+        private readonly RandomTraversalEngine traversal = new RandomTraversalEngine();
+
+        //---------------------------画布（缩放 / 平移）状态-------------------------
+        private const double PanEdgeMargin = 60;   // 平移时图片至少留在可视区的边距
+        private CanvasViewState canvas = CanvasViewState.Fit;   // Scale = 1.0 即恰好适配窗口
+
+        // 右键 / 中键手势：按下后先不判定，位移越过阈值才算 drag，否则算 click
+        private MouseButton? pendingGestureButton;
+        private Button? pendingGesturePathButton;     // 中键按下时命中的面包屑按钮（可能为 null）
+        private Point gestureStartPos;
+        private Point lastPanPos;
+        private bool isPanning;
+
         // 应用设置
         public AppSettings settings;
         
@@ -52,6 +66,9 @@ namespace ImageSelector
             Closing += (s, e) => {
                 settings.Save();
             };
+
+            // 窗口尺寸变化后重新收敛画布平移边界，避免图片被留在可视区外找不回来
+            RootGrid.SizeChanged += (s, e) => ReclampCanvas();
             loaded = true;
         }
 
@@ -137,7 +154,10 @@ namespace ImageSelector
         //---------------------------鼠标拖拽图片-------------------------
         private void Window_MouseMove(object sender, MouseEventArgs e)
         {
-            if (e.LeftButton == MouseButtonState.Pressed)
+            // 右键 / 中键正在做画布手势时，不要触发文件拖放
+            if (pendingGestureButton.HasValue || isPanning) return;
+
+            if (e.LeftButton == MouseButtonState.Pressed && !string.IsNullOrEmpty(currentImagePath))
             {
                 // 开始拖动操作
                 DataObject data = new DataObject(DataFormats.FileDrop, new[] { currentImagePath });
@@ -161,8 +181,12 @@ namespace ImageSelector
         }
         private void UpdateHintVisibility()
         {
-            // 根据是否有有效路径来控制提示的可见性
+            // 已经加载出图片，提示文字和"恢复上次会话"按钮都该退场。
+            // HintArea 在 XAML 中位于 Image 之下，只隐藏文字的话，
+            // 平移画布把图片挪开后按钮会从底下露出来，而且仍然可以被点到。
+            // 折叠整个容器才能同时挡住渲染和命中测试。
             HintTextBlock.Visibility = Visibility.Collapsed;
+            HintArea.Visibility = Visibility.Collapsed;
         }
 
         private void LoadImagesFromDirectory(string directory)
@@ -174,6 +198,7 @@ namespace ImageSelector
             imageFiles = GetImageFiles(directory);
             if (imageFiles.Any())
             {
+                traversal.Rebuild(imageFiles); // 重建遍历牌堆，必须在 LoadRandomImage 之前
                 UpdateHintVisibility(); // 更新提示信息的可见性
                 UpdatePathButtons(directory, null); //根据当前目录更新路径按钮，并且不显示文件名
                 LoadRandomImage(); // 初始化显示随机图片
@@ -204,9 +229,17 @@ namespace ImageSelector
         private void LoadRandomImage()  
         {
             if (!imageFiles.Any()) return;
-            Random rand = new Random();
-            currentIndex = rand.Next(imageFiles.Count);
-            DisplayImage(imageFiles[currentIndex]);
+
+            // 由遍历引擎发牌：一轮之内不重复、不遗漏，且相邻两次保持足够跳跃距离；
+            // 子目录按"饥饿度"轮转，深层小目录不会被大目录长期盖住。
+            int next = traversal.Next();
+            if (next < 0 || next >= imageFiles.Count)
+            {
+                next = new Random().Next(imageFiles.Count); // 兜底：引擎未就绪时退回纯随机
+            }
+
+            currentIndex = next;
+            DisplayImage(imageFiles[next]);
         }
 
         private void DisplayImage(string imagePath)
@@ -239,31 +272,45 @@ namespace ImageSelector
             // 计算适合窗口的缩放比例
             ScaleImageToFit(bitmap);
 
+            // 换图后画布复位：上一张的放大/平移状态不应带到下一张
+            ResetCanvasTransform();
+
             if (!viewedImages.Contains(imagePath)) // 仅在缓存中不包含当前图片时添加
             {
                 CacheImage(imagePath);
             }
 
             UpdateIndicator();
+            // 圆点指示器常驻：加载出第一张图后就不再隐藏
             if (IndicatorPanel.Visibility != Visibility.Visible)
             {
                 IndicatorPanel.Visibility = Visibility.Visible;
             }
         }
 
-        private void ScaleImageToFit(BitmapImage bitmap)
+        // 参数用 BitmapSource（BitmapImage 的基类），这样 F 键重新适配时
+        // 可以直接把 RandomImage.Source 传进来
+        private void ScaleImageToFit(BitmapSource bitmap)
         {
-            // 获取窗口的当前尺寸
-            double windowWidth = this.ActualWidth;
-            double windowHeight = this.ActualHeight;
+            // 用客户区（RootGrid）尺寸而非窗口外框尺寸：外框含标题栏和边框，
+            // 拿它算 fit 会让图片略微溢出，同时导致画布缩放锚点的居中原点算偏。
+            double viewWidth = RootGrid.ActualWidth;
+            double viewHeight = RootGrid.ActualHeight;
+            if (viewWidth <= 0 || viewHeight <= 0)
+            {
+                // 布局尚未完成时退回窗口尺寸
+                viewWidth = this.ActualWidth;
+                viewHeight = this.ActualHeight;
+            }
 
             // 获取图片的原始尺寸
             double imageWidth = bitmap.Width;
             double imageHeight = bitmap.Height;
+            if (imageWidth <= 0 || imageHeight <= 0 || viewWidth <= 0 || viewHeight <= 0) return;
 
             // 计算宽高比例
-            double widthScale = windowWidth / imageWidth;
-            double heightScale = windowHeight / imageHeight;
+            double widthScale = viewWidth / imageWidth;
+            double heightScale = viewHeight / imageHeight;
             double scale = Math.Min(widthScale, heightScale); // 选择最小的缩放比例以保持纵横比
 
             // 设置 Image 控件的尺寸
@@ -271,13 +318,11 @@ namespace ImageSelector
             RandomImage.Height = imageHeight * scale;
         }
         // 双击图片：使用系统默认方式打开图片
+        // 中键与右键已交给 Window 层的画布手势统一处理，这里只认左键
         private void RandomImage_MouseDown(object sender, MouseButtonEventArgs e)
         {
-            if (e.MiddleButton == MouseButtonState.Pressed) // 确保中键点击
-            {
-                OpenImage(currentImagePath); // 添加调用
-                return;
-            }
+            if (e.ChangedButton != MouseButton.Left) return;
+
             if ((DateTime.Now - lastClickTime).TotalMilliseconds <= doubleClickInterval)
             {
                 // 执行打开图片的逻辑
@@ -316,37 +361,40 @@ namespace ImageSelector
 
         private void UpdatePathButtons(string directory, string filename)
         {
-            isMouseOverCurrentPathButton = false;
             PathButtonPanel.Children.Clear(); // 清空现有按钮
 
-            // 按路径分割为部分
-            string[] pathParts = directory.Split(Path.DirectorySeparatorChar);
-            string currentPath = "";
+            string normalizedCurrent = PathBreadcrumb.NormalizeForCompare(currentDirectory);
 
-            for (int i = 0; i < pathParts.Length; i++)
+            foreach (PathSegment segment in PathBreadcrumb.Split(directory))
             {
-                var part = pathParts[i];
-                currentPath = Path.Combine(currentPath, part); // 构建每一部分的完整路径
-                bool isCurrentDirButton = string.Equals(currentPath, currentDirectory, StringComparison.InvariantCultureIgnoreCase);
+                bool isCurrentDirButton = string.Equals(
+                    PathBreadcrumb.NormalizeForCompare(segment.FullPath), normalizedCurrent,
+                    StringComparison.InvariantCultureIgnoreCase);
 
                 Button pathButton = new Button
                 {
                     Focusable = false,
-                    Content = part,
+                    Content = segment.Label,
                     Margin = new Thickness(2),
                     Padding = new Thickness(12),
-                    Tag = currentPath, // 将当前路径作为按钮的 Tag 属性
+                    Tag = segment.FullPath, // 将当前路径作为按钮的 Tag 属性
                 };
 
-                if (isCurrentDirButton)
+                pathButton.Background = new SolidColorBrush(isCurrentDirButton ? Color.FromRgb(0, 74, 230) : settings.GetButtonColorFromPresetID());
+                pathButton.Foreground = new SolidColorBrush(isCurrentDirButton ? Colors.White : settings.GetForegroundColorFromPresetID());
+
+                if (!segment.Clickable)
                 {
-                    pathButton.MouseEnter += (s, e) => { isMouseOverCurrentPathButton = true; };
-                    pathButton.MouseLeave += (s, e) => { isMouseOverCurrentPathButton = false; };
+                    // 盘符（或 UNC 主机名）纯展示：关掉命中测试后既不响应点击，
+                    // 也不会弹同级目录菜单；降低不透明度让用户一眼看出它点不动。
+                    pathButton.IsHitTestVisible = false;
+                    pathButton.Cursor = Cursors.Arrow;
+                    pathButton.Opacity = 0.6;
+                    PathButtonPanel.Children.Add(pathButton);
+                    continue;
                 }
 
                 pathButton.MouseRightButtonDown += PathButton_MouseRightButtonDown;
-                pathButton.Background = new SolidColorBrush(isCurrentDirButton ? Color.FromRgb(0, 74, 230) : settings.GetButtonColorFromPresetID());
-                pathButton.Foreground = new SolidColorBrush(isCurrentDirButton ? Colors.White : settings.GetForegroundColorFromPresetID());
                 pathButton.ToolTip = LanguageResources.GetText("PathButtonTooltip", settings.CurrentLanguage);
                 pathButton.Click += PathButton_Click;
                 PathButtonPanel.Children.Add(pathButton);
@@ -373,19 +421,12 @@ namespace ImageSelector
 
         private void PathButton_Click(object sender, RoutedEventArgs e)
         {
-            var button = sender as Button;
-            if (button != null)
+            // 中键打开资源管理器已移到 Window 层统一处理（见 HandleMiddleClick），
+            // 这里只负责左键切换目录。
+            if (sender is Button button && button.Tag is string selectedDirectory
+                && !string.IsNullOrEmpty(selectedDirectory) && Directory.Exists(selectedDirectory))
             {
-                string selectedDirectory = button.Tag.ToString(); // 获取按钮的路径
-                if (Directory.Exists(selectedDirectory))
-                {
-                    if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
-                    {
-                        OpenFolderInExplorer(selectedDirectory);
-                        return;
-                    }
-                    LoadImagesFromDirectory(selectedDirectory); // 从该路径加载图像
-                }
+                LoadImagesFromDirectory(selectedDirectory); // 从该路径加载图像
             }
         }
         private void OpenFolderInExplorer(string path)
@@ -401,19 +442,18 @@ namespace ImageSelector
         }
         private void FileButton_Click(object sender, RoutedEventArgs e)
         {
-            var button = sender as Button;
-            if (button != null)
+            if (sender is Button button && button.Tag is string selectedFile)
             {
-                string selectedFile = button.Tag.ToString(); // 获取文件的完整路径
-                OpenImage(selectedFile);
-                
+                OpenImage(selectedFile); // 获取文件的完整路径
             }
         }
         
         private void PathButton_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
         {
-            Button clickedButton = (Button)sender; // 获取点击的按钮
-            string buttonFilePath = clickedButton.Tag.ToString(); // 获取对应的文件路径
+            if (!(sender is Button clickedButton)) return;
+
+            string? buttonFilePath = clickedButton.Tag as string; // 获取对应的文件路径
+            if (string.IsNullOrEmpty(buttonFilePath)) return;
 
             // 获取同级目录
             var siblingDirectories = GetSiblingDirectories(buttonFilePath);
@@ -512,33 +552,318 @@ namespace ImageSelector
                 case Key.Space:
                     LoadRandomImage(); // 空格键
                     break;
+                case Key.F:
+                    RefitCanvas(); // F 键：重新适配窗口并复位画布
+                    break;
                 case Key.Tab:
                     ToggleSettingsPanel(); // Tab 键
                     break;
             }
         }
-        private bool IsMouseOverCurrentPathButton() => isMouseOverCurrentPathButton;
 
-        private void Window_MouseWheel(object sender, MouseWheelEventArgs e)
+        //---------------------------画布：缩放与平移-------------------------
+        // 缩放基准是 ScaleImageToFit 算出的"适配窗口"尺寸，canvas.Scale = 1.0 即适配状态。
+        // 全部数学运算都在 CanvasViewState 里，这里只负责取布局信息和把结果写回 RenderTransform。
+
+        private void ApplyCanvasTransform()
         {
-            if (e.Delta > 0) // 滚动向上，切换到上一张
+            CanvasScaleTransform.ScaleX = canvas.Scale;
+            CanvasScaleTransform.ScaleY = canvas.Scale;
+            CanvasTranslateTransform.X = canvas.OffsetX;
+            CanvasTranslateTransform.Y = canvas.OffsetY;
+        }
+
+        private void ResetCanvasTransform()
+        {
+            canvas = CanvasViewState.Fit;
+            ApplyCanvasTransform();
+        }
+
+        /// <summary>
+        /// 重新适配窗口并复位画布（F 键）。
+        /// 只复位 transform 是不够的：图片只在换图时才做适配，窗口被拉伸过之后
+        /// scale=1 已经不再等于"贴合窗口"，所以要按当前尺寸重算一次。
+        /// </summary>
+        private void RefitCanvas()
+        {
+            if (RandomImage.Source is BitmapSource source)
             {
-                if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control || IsMouseOverCurrentPathButton())
+                ScaleImageToFit(source);
+            }
+            ResetCanvasTransform();
+        }
+
+        /// <summary>
+        /// 取图片布局尺寸（不受 RenderTransform 影响），用于换算缩放锚点与平移边界。
+        /// </summary>
+        private Size GetImageLayoutSize()
+        {
+            double w = RandomImage.ActualWidth;
+            double h = RandomImage.ActualHeight;
+            if (double.IsNaN(w) || w <= 0) w = RandomImage.Width;
+            if (double.IsNaN(h) || h <= 0) h = RandomImage.Height;
+            if (double.IsNaN(w) || w < 0) w = 0;
+            if (double.IsNaN(h) || h < 0) h = 0;
+            return new Size(w, h);
+        }
+
+        /// <summary>
+        /// 汇总画布运算需要的布局信息。Image 设了明确宽高后在 Grid 内居中，
+        /// 所以布局原点就是两侧留白的一半。
+        /// </summary>
+        private CanvasViewState.Layout GetCanvasLayout()
+        {
+            Size size = GetImageLayoutSize();
+            return new CanvasViewState.Layout
+            {
+                ImageWidth = size.Width,
+                ImageHeight = size.Height,
+                OriginX = Math.Max(0, (RootGrid.ActualWidth - size.Width) / 2),
+                OriginY = Math.Max(0, (RootGrid.ActualHeight - size.Height) / 2),
+                ViewWidth = RootGrid.ActualWidth,
+                ViewHeight = RootGrid.ActualHeight
+            };
+        }
+
+        /// <summary>
+        /// 以鼠标指针为锚点缩放，并立刻把平移量收敛回合法范围。
+        /// </summary>
+        private void ZoomCanvasAt(Point mouseInGrid, double factor)
+        {
+            CanvasViewState.Layout layout = GetCanvasLayout();
+            CanvasViewState next = canvas
+                .ZoomAt(layout, mouseInGrid.X, mouseInGrid.Y, factor)
+                .Clamp(layout, PanEdgeMargin);
+
+            if (next.Equals(canvas)) return;
+            canvas = next;
+            ApplyCanvasTransform();
+        }
+
+        private void PanCanvasTo(Point mouseInGrid)
+        {
+            CanvasViewState.Layout layout = GetCanvasLayout();
+            canvas = canvas
+                .PanBy(mouseInGrid.X - lastPanPos.X, mouseInGrid.Y - lastPanPos.Y)
+                .Clamp(layout, PanEdgeMargin);
+            lastPanPos = mouseInGrid;
+            ApplyCanvasTransform();
+        }
+
+        /// <summary>
+        /// 窗口尺寸变化后重新收敛平移边界，避免图片被留在可视区外。
+        /// </summary>
+        private void ReclampCanvas()
+        {
+            CanvasViewState next = canvas.Clamp(GetCanvasLayout(), PanEdgeMargin);
+            if (next.Equals(canvas)) return;
+            canvas = next;
+            ApplyCanvasTransform();
+        }
+
+        //---------------------------右键 / 中键手势-------------------------
+        // 右键：按住 + 滚轮 = 缩放，按住 + 拖拽 = 平移，原地单击 = 画布复位
+        // 中键：按住 + 拖拽 = 平移，原地单击 = 沿用旧逻辑（面包屑开资源管理器 / 图片开默认程序）
+
+        private void Window_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
+        {
+            Point mouseInGrid = e.GetPosition(RootGrid);
+
+            // 缩放的唯一入口：右键按住 + 滚轮。
+            // 不能只看 e.RightButton 是否按下：右键点在面包屑上会弹同级目录菜单，
+            // 那种情况下滚轮不该变成缩放。
+            if (pendingGestureButton == MouseButton.Right)
+            {
+                ZoomCanvasAt(mouseInGrid, CanvasViewState.WheelToFactor(e.Delta));
+                e.Handled = true;
+                return;
+            }
+
+            // 正在平移时不要把滚轮解释成切图
+            if (isPanning)
+            {
+                e.Handled = true;
+                return;
+            }
+
+            // 其余情况滚轮只切图，不缩放：窗口纵向对半分，
+            // 上半 = 顺序切图（↑/↓ 那套），下半 = 缓存切图（←/→ 那套）
+            if (RandomImage.Source == null || RootGrid.ActualHeight <= 0)
+            {
+                e.Handled = true;
+                return;
+            }
+
+            if (mouseInGrid.Y < RootGrid.ActualHeight / 2)
+            {
+                if (e.Delta > 0) showPreviousImageInOrder();
+                else if (e.Delta < 0) showNextImageInOrder();
+            }
+            else
+            {
+                if (e.Delta > 0) ShowPreviousImage();
+                else if (e.Delta < 0) ShowNextImage();
+            }
+            e.Handled = true;
+        }
+
+        private void Window_PreviewMouseDown(object sender, MouseButtonEventArgs e)
+        {
+            if (e.ButtonState != MouseButtonState.Pressed) return;
+            if (e.ChangedButton != MouseButton.Right && e.ChangedButton != MouseButton.Middle) return;
+            if (!CanStartCanvasGesture(e.OriginalSource as DependencyObject, e.ChangedButton)) return;
+
+            pendingGestureButton = e.ChangedButton;
+            // 捕获鼠标后 OriginalSource 不再可靠，面包屑命中结果必须在按下时就记下来
+            pendingGesturePathButton = e.ChangedButton == MouseButton.Middle
+                ? FindPathButton(e.OriginalSource as DependencyObject)
+                : null;
+
+            gestureStartPos = e.GetPosition(RootGrid);
+            lastPanPos = gestureStartPos;
+            isPanning = false;
+
+            CaptureMouse();
+            e.Handled = true;
+        }
+
+        private void Window_PreviewMouseMove(object sender, MouseEventArgs e)
+        {
+            if (!pendingGestureButton.HasValue) return;
+
+            Point position = e.GetPosition(RootGrid);
+
+            if (!isPanning)
+            {
+                // 阈值内视为 click 的抖动，不启动平移，中键才能保持"点击"语义
+                double threshold = Math.Max(SystemParameters.MinimumHorizontalDragDistance,
+                                            SystemParameters.MinimumVerticalDragDistance);
+                if (Math.Abs(position.X - gestureStartPos.X) < threshold &&
+                    Math.Abs(position.Y - gestureStartPos.Y) < threshold)
                 {
-                    showPreviousImageInOrder();
                     return;
                 }
-                ShowPreviousImage();
+
+                isPanning = true;
+                lastPanPos = gestureStartPos;
+                Cursor = Cursors.SizeAll;
             }
-            else if (e.Delta < 0) // 滚动向下，切换到下一张
+
+            PanCanvasTo(position);
+            e.Handled = true;
+        }
+
+        private void Window_PreviewMouseUp(object sender, MouseButtonEventArgs e)
+        {
+            if (!pendingGestureButton.HasValue || e.ChangedButton != pendingGestureButton.Value) return;
+
+            MouseButton button = pendingGestureButton.Value;
+            Button? pathButton = pendingGesturePathButton;
+            bool wasDrag = isPanning;
+            EndCanvasGesture();
+
+            if (wasDrag)
             {
-                if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control || IsMouseOverCurrentPathButton())
+                // 已经平移过，抬手不算点击
+                e.Handled = true;
+                return;
+            }
+
+            if (button == MouseButton.Middle)
+            {
+                HandleMiddleClick(pathButton);
+                e.Handled = true;
+            }
+            else if (button == MouseButton.Right)
+            {
+                // 右键原地单击：与 F 键一致，重新适配窗口并复位画布
+                RefitCanvas();
+                e.Handled = true;
+            }
+        }
+
+        private void Window_LostMouseCapture(object sender, MouseEventArgs e)
+        {
+            if (pendingGestureButton.HasValue) EndCanvasGesture();
+        }
+
+        /// <summary>
+        /// 中键单击：命中面包屑就在资源管理器里打开该目录，否则沿用打开当前图片的旧逻辑。
+        /// </summary>
+        private void HandleMiddleClick(Button? pathButton)
+        {
+            string? target = pathButton?.Tag as string;
+            if (!string.IsNullOrEmpty(target))
+            {
+                if (Directory.Exists(target))
                 {
-                    showNextImageInOrder();
+                    OpenFolderInExplorer(target);
                     return;
                 }
-                ShowNextImage();
+                if (File.Exists(target))
+                {
+                    OpenImage(target);
+                    return;
+                }
             }
+            OpenImage(currentImagePath);
+        }
+
+        /// <summary>
+        /// 判断这次按下是否该被画布手势接管。
+        /// 设置面板和提示区的控件要保持原生交互；右键还要留给面包屑的同级目录菜单。
+        /// </summary>
+        private bool CanStartCanvasGesture(DependencyObject? source, MouseButton button)
+        {
+            if (source == null) return true;
+            if (IsDescendantOf(source, SettingsPanel)) return false;
+            if (IsDescendantOf(source, HintArea)) return false;
+            if (button == MouseButton.Right && IsDescendantOf(source, PathButtonPanel)) return false;
+            return true;
+        }
+
+        private Button? FindPathButton(DependencyObject? source)
+        {
+            DependencyObject? node = source;
+            int guard = 0;
+            while (node != null && guard++ < 256)
+            {
+                if (node is Button button && PathButtonPanel.Children.Contains(button)) return button;
+                node = GetVisualOrLogicalParent(node);
+            }
+            return null;
+        }
+
+        private static bool IsDescendantOf(DependencyObject? child, DependencyObject? ancestor)
+        {
+            if (ancestor == null) return false;
+
+            DependencyObject? node = child;
+            int guard = 0;
+            while (node != null && guard++ < 256)
+            {
+                if (ReferenceEquals(node, ancestor)) return true;
+                node = GetVisualOrLogicalParent(node);
+            }
+            return false;
+        }
+
+        private static DependencyObject? GetVisualOrLogicalParent(DependencyObject node)
+        {
+            if (node is Visual || node is System.Windows.Media.Media3D.Visual3D)
+            {
+                return VisualTreeHelper.GetParent(node);
+            }
+            return LogicalTreeHelper.GetParent(node);
+        }
+
+        private void EndCanvasGesture()
+        {
+            pendingGestureButton = null;
+            pendingGesturePathButton = null;
+            isPanning = false;
+            Cursor = null;
+            if (IsMouseCaptured) ReleaseMouseCapture();
         }
 
         private Dictionary<string, List<int>> directoryImageIndices = new Dictionary<string, List<int>>();

@@ -85,9 +85,9 @@ namespace ImageSelector
             },
             {"PathButtonTooltip", new Dictionary<Language, string>
                 {
-                    {Language.Chinese, "单击切换路径，Ctrl+单击打开文件夹"},
-                    {Language.English, "Click to switch path, Ctrl+Click to open folder"},
-                    {Language.Japanese, "クリックでパスを切り替え、Ctrl+クリックでフォルダを開く"}
+                    {Language.Chinese, "左键切换路径，中键在资源管理器中打开，右键查看同级目录"},
+                    {Language.English, "Left-click to switch path, middle-click to open in Explorer, right-click for sibling folders"},
+                    {Language.Japanese, "左クリックでパス切替、中クリックでエクスプローラーを開く、右クリックで同階層を表示"}
                 }
             },
             {"FileButtonTooltip", new Dictionary<Language, string>
