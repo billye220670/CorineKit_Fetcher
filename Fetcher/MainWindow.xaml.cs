@@ -54,6 +54,16 @@ namespace ImageSelector
         private string? displayError;
         private bool isVideoPaused;
 
+        //---------------------------左侧 fav 分栏-------------------------
+        private const double FavSplitterWidth = 8;
+        private const double MinPaneWidth = 300;
+        private const double MinFavRatio = 0.25;
+        private const double MaxFavRatio = 0.75;
+        private double favSplitRatio = 0.5;
+        private bool isFavPanelOpen;
+        private bool isDraggingFavSplitter;
+        private bool isRightDraggingOut;
+
         // 右键 / 中键手势：按下后先不判定，位移越过阈值才算 drag，否则算 click
         private MouseButton? pendingGestureButton;
         private Button? pendingGesturePathButton;     // 中键按下时命中的面包屑按钮（可能为 null）
@@ -93,6 +103,7 @@ namespace ImageSelector
             // 表现就是关窗后"未响应"。TeardownMedia → StopVideo 的顺序已经是对的。
             Closing += (s, e) => {
                 settings.Save();
+                FavView.Shutdown();
                 TeardownMedia();
                 gifPlayer.Dispose();
                 videoResolver.Dispose();
@@ -102,8 +113,26 @@ namespace ImageSelector
             gifPlayer.FrameReady += GifPlayer_FrameReady;
             gifPlayer.Failed += GifPlayer_Failed;
 
-            // 窗口尺寸变化后重新收敛画布平移边界，避免图片被留在可视区外找不回来
-            RootGrid.SizeChanged += (s, e) => ReclampCanvas();
+            // 视口尺寸变化（窗口缩放、Space 开合、拖分隔条）时实时重算 fit 基准，
+            // 再收敛平移边界；没手动放大时始终贴合视口。
+            RootGrid.SizeChanged += (s, e) => HandleFetcherViewportSizeChanged();
+            WindowRoot.SizeChanged += (s, e) =>
+            {
+                if (isFavPanelOpen) ApplyFavSplitRatio();
+            };
+
+            FavSplitter.MouseEnter += (s, e) => SetFavSplitterHover(true);
+            FavSplitter.MouseLeave += (s, e) => SetFavSplitterHover(false);
+
+            // 失焦时鼠标抬起可能收不到；把两边的 gesture / capture / 光标一起收干净，
+            // 否则会留下"移动光标粘手、失焦后 hover 还会拖"的状态。
+            Deactivated += (s, e) =>
+            {
+                CancelCanvasGesture();
+                FavView.CancelGesture();
+                CancelFavSplitterDrag();
+            };
+
             loaded = true;
         }
 
@@ -117,7 +146,20 @@ namespace ImageSelector
             LanguageLabel.Foreground = new SolidColorBrush(settings.GetForegroundColorFromPresetID());
             WheelZoneLabel.Foreground = new SolidColorBrush(settings.GetForegroundColorFromPresetID());
             this.Background = new SolidColorBrush(settings.GetBackgroundColorFromPresetID()); //恢复上次会话的背景色
-            
+
+            // 左侧 fav 面板跟随同一套主题；空列表时露出的就是这块背景。
+            FavView.ApplyTheme(settings.GetBackgroundColorFromPresetID());
+            Color foreground = settings.GetForegroundColorFromPresetID();
+            FavSplitterLine.Background = new SolidColorBrush(Color.FromArgb(48, foreground.R, foreground.G, foreground.B));
+        }
+
+        private void SetFavSplitterHover(bool hover)
+        {
+            if (isDraggingFavSplitter) return;
+
+            Color foreground = settings.GetForegroundColorFromPresetID();
+            FavSplitterLine.Background = new SolidColorBrush(
+                Color.FromArgb((byte)(hover ? 130 : 48), foreground.R, foreground.G, foreground.B));
         }
 
         private void SetupInitialUI()
@@ -195,25 +237,83 @@ namespace ImageSelector
 
             if (e.LeftButton == MouseButtonState.Pressed && !string.IsNullOrEmpty(currentImagePath))
             {
-                // 开始拖动操作
-                DataObject data = new DataObject(DataFormats.FileDrop, new[] { currentImagePath });
-                DragDrop.DoDragDrop(this, data, DragDropEffects.Copy); // 拖动效果为复制
+                // 开始拖动操作。拖拽期间置位，Drop 里据此区分“右→左收藏”和外部拖入。
+                isRightDraggingOut = true;
+                try
+                {
+                    DataObject data = new DataObject(DataFormats.FileDrop, new[] { currentImagePath });
+                    DragDrop.DoDragDrop(this, data, DragDropEffects.Copy); // 拖动效果为复制
+                }
+                finally
+                {
+                    isRightDraggingOut = false;
+                }
             }
         }
         //---------------------------拖放图片进入APP-------------------------
         private void Window_Drop(object sender, DragEventArgs e)
         {
-            if (e.Data.GetDataPresent(DataFormats.FileDrop))
+            if (!e.Data.GetDataPresent(DataFormats.FileDrop)) return;
+
+            if (e.Data.GetData(DataFormats.FileDrop) is not string[] filePaths || filePaths.Length == 0) return;
+
+            Point favPoint = e.GetPosition(FavView);
+            bool overFav = isFavPanelOpen
+                && FavView.Visibility == Visibility.Visible
+                && favPoint.X >= 0 && favPoint.Y >= 0
+                && favPoint.X <= FavView.ActualWidth && favPoint.Y <= FavView.ActualHeight;
+
+            Point rightPoint = e.GetPosition(RootGrid);
+            bool overRight = rightPoint.X >= 0 && rightPoint.Y >= 0
+                && rightPoint.X <= RootGrid.ActualWidth && rightPoint.Y <= RootGrid.ActualHeight;
+
+            // 左侧 fav → 右侧：右侧切到该图所在目录继续浏览，但不清缓存。
+            if (FavView.IsDraggingOut)
             {
-                string[] filePaths = (string[])e.Data.GetData(DataFormats.FileDrop);
-                foreach (string filePath in filePaths)
+                if (overRight)
                 {
-                    if (Directory.Exists(filePath))
+                    foreach (string path in filePaths)
                     {
-                        LoadImagesFromDirectory(filePath); // 从新目录加载图像
+                        if (File.Exists(path) && MediaFormats.IsSupported(path))
+                        {
+                            ShowFavoriteOnRight(path);
+                            break;
+                        }
                     }
                 }
+                e.Handled = true;
+                return;
             }
+
+            // 右侧当前图 → 左侧：加入 fav；同侧落下不处理。
+            if (isRightDraggingOut)
+            {
+                if (overFav)
+                {
+                    foreach (string path in filePaths)
+                    {
+                        FavView.AddFavorite(path);
+                    }
+                }
+                e.Handled = true;
+                return;
+            }
+
+            // 外部拖入只在右侧生效：文件夹仍按原逻辑加载。左侧不接收外部导入。
+            if (!overRight)
+            {
+                e.Handled = true;
+                return;
+            }
+
+            foreach (string filePath in filePaths)
+            {
+                if (Directory.Exists(filePath))
+                {
+                    LoadImagesFromDirectory(filePath); // 从新目录加载图像
+                }
+            }
+            e.Handled = true;
         }
         private void UpdateHintVisibility()
         {
@@ -246,6 +346,40 @@ namespace ImageSelector
                                 LanguageResources.GetText("Notice", settings.CurrentLanguage),
                                 MessageBoxButton.OK, MessageBoxImage.Information);
             }
+        }
+
+        /// <summary>
+        /// 左侧 fav 拖回右侧：把右侧浏览根切到该图所在目录并显示它。
+        /// 不清 viewedImages，旧缓存仍可 ←/→ 回滚；但不改写 LastPath，
+        /// 下次启动仍恢复用户上次主动加载的文件夹。
+        /// </summary>
+        private void ShowFavoriteOnRight(string mediaPath)
+        {
+            if (string.IsNullOrEmpty(mediaPath)) return;
+            if (!File.Exists(mediaPath) || !MediaFormats.IsSupported(mediaPath)) return;
+
+            string? directory = Path.GetDirectoryName(mediaPath);
+            if (string.IsNullOrEmpty(directory)) return;
+
+            currentDirectory = directory;
+            imageFiles = GetMediaFiles(directory);
+            if (imageFiles.Count == 0) imageFiles.Add(mediaPath);
+
+            int index = imageFiles.FindIndex(
+                item => string.Equals(item, mediaPath, StringComparison.OrdinalIgnoreCase));
+            if (index < 0)
+            {
+                // 目录扫描没覆盖到（权限/竞态）时至少把这一张放进当前列表。
+                imageFiles.Insert(0, mediaPath);
+                index = 0;
+            }
+
+            currentIndex = index;
+            traversal.Rebuild(imageFiles);
+            BuildDirectoryIndex();
+            UpdateCurrentIndex(mediaPath);
+            UpdateHintVisibility();
+            DisplayMedia(mediaPath);
         }
 
         /// <summary>
@@ -320,6 +454,12 @@ namespace ImageSelector
             {
                 CacheImage(mediaPath);
             }
+            else
+            {
+                // 从面包屑 / 文件按钮 / 左侧 fav 跳回缓存里已有的图时，
+                // 当前位置也要跟着对齐，否则圆点和 ←/→ 还停在上一张。
+                viewedIndex = viewedImages.IndexOf(mediaPath);
+            }
 
             UpdateIndicator();
             // 圆点指示器常驻：加载出第一张图后就不再隐藏
@@ -332,7 +472,8 @@ namespace ImageSelector
         /// <summary>把 currentIndex 以及"当前子目录的索引区间"对齐到指定文件。</summary>
         private void UpdateCurrentIndex(string mediaPath)
         {
-            int newIndex = imageFiles.IndexOf(mediaPath);
+            int newIndex = imageFiles.FindIndex(
+                item => string.Equals(item, mediaPath, StringComparison.OrdinalIgnoreCase));
             if (newIndex < 0) return;
 
             currentIndex = newIndex;
@@ -821,6 +962,17 @@ namespace ImageSelector
                 return false; // 直接返回 false
             }
         }
+        /// <summary>
+        /// Space 在 Preview 阶段处理：MediaElement 自带的播放/暂停命令会吃掉 Space，
+        /// 拖过视频后焦点若落在媒体上，KeyDown 就收不到。这里先接管，保证全局可切。
+        /// </summary>
+        private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key != Key.Space) return;
+            if (!e.IsRepeat) ToggleFavPanel();
+            e.Handled = true;
+        }
+
         private void Window_KeyDown(object sender, KeyEventArgs e)
         {
             switch (e.Key)
@@ -837,14 +989,21 @@ namespace ImageSelector
                 case Key.Down:
                     showNextImageInOrder(); // 下方向键
                     break;
-                case Key.Space:
-                    LoadRandomImage(); // 空格键
+                case Key.Delete:
+                    // 只在鼠标停在左侧 fav 面板上时移除收藏；绝不动右侧文件。
+                    if (isFavPanelOpen && FavView.IsMouseOver)
+                    {
+                        FavView.RemoveCurrent();
+                        e.Handled = true;
+                    }
                     break;
                 case Key.F:
-                    RefitCanvas(); // F 键：重新适配窗口并复位画布
+                    if (isFavPanelOpen && FavView.IsMouseOver) FavView.Refit();
+                    else RefitCanvas(); // F 键：重新适配窗口并复位画布
                     break;
                 case Key.P:
-                    TogglePlayback(); // P 键：GIF / 视频 播放暂停
+                    if (isFavPanelOpen && FavView.IsMouseOver) FavView.TogglePlayback();
+                    else TogglePlayback(); // P 键：GIF / 视频 播放暂停
                     break;
                 case Key.Tab:
                     ToggleSettingsPanel(); // Tab 键
@@ -916,10 +1075,12 @@ namespace ImageSelector
         private Size GetImageLayoutSize()
         {
             FrameworkElement target = ActiveMediaElement;
-            double w = target.ActualWidth;
-            double h = target.ActualHeight;
-            if (double.IsNaN(w) || w <= 0) w = target.Width;
-            if (double.IsNaN(h) || h <= 0) h = target.Height;
+            // 优先用显式 Width/Height：分栏/拖分隔条时刚重算完 fit，
+            // ActualWidth 可能还是上一轮布局的值；先读它会把缩放锚点和边界算偏。
+            double w = target.Width;
+            double h = target.Height;
+            if (double.IsNaN(w) || w <= 0) w = target.ActualWidth;
+            if (double.IsNaN(h) || h <= 0) h = target.ActualHeight;
             if (double.IsNaN(w) || w < 0) w = 0;
             if (double.IsNaN(h) || h < 0) h = 0;
             return new Size(w, h);
@@ -985,6 +1146,10 @@ namespace ImageSelector
 
         private void Window_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
         {
+            // 按位置分区，而不是只看 OriginalSource：左栏 / 分隔条上的滚轮归左栏，
+            // 即使右栏手势状态因为某种原因没清干净，也不能把它抢过来。
+            if (!IsPointInside(RootGrid, e.GetPosition(RootGrid))) return;
+
             // 缩放的唯一入口：右键按住 + 滚轮。
             // 不能只看 e.RightButton 是否按下：右键点在面包屑上会弹同级目录菜单，
             // 那种情况下滚轮不该变成缩放。
@@ -1003,6 +1168,10 @@ namespace ImageSelector
             }
 
             DependencyObject? source = e.OriginalSource as DependencyObject;
+
+            // 左侧 fav 面板 / 分隔条有自己的滚轮语义（顺序切 fav、右键缩放），
+            // 窗口层不接管，交给 FavView 的 PreviewMouseWheel。
+            if (IsDescendantOf(source, FavView) || IsDescendantOf(source, FavSplitter)) return;
 
             // 悬停在展开的设置面板上时不接管滚轮，交给面板里的 Slider / ComboBox 自己滚。
             // 面板收起时是 Collapsed，命中不到，所以下面的分区判断不受影响。
@@ -1038,6 +1207,10 @@ namespace ImageSelector
         {
             if (e.ButtonState != MouseButtonState.Pressed) return;
             if (e.ChangedButton != MouseButton.Right && e.ChangedButton != MouseButton.Middle) return;
+
+            // 右键/中键画布手势只属于右侧 Fetcher 视口。用位置判定兜底，避免
+            // OriginalSource 落在 MediaElement 模板里时误判成右栏，从左侧抢走 capture。
+            if (!IsPointInside(RootGrid, e.GetPosition(RootGrid))) return;
             if (!CanStartCanvasGesture(e.OriginalSource as DependencyObject, e.ChangedButton)) return;
 
             pendingGestureButton = e.ChangedButton;
@@ -1111,7 +1284,19 @@ namespace ImageSelector
 
         private void Window_LostMouseCapture(object sender, MouseEventArgs e)
         {
-            if (pendingGestureButton.HasValue) EndCanvasGesture();
+            CancelCanvasGesture();
+        }
+
+        private void CancelCanvasGesture()
+        {
+            if (pendingGestureButton.HasValue || isPanning)
+            {
+                EndCanvasGesture();
+            }
+            else
+            {
+                Cursor = null;
+            }
         }
 
         /// <summary>
@@ -1145,6 +1330,7 @@ namespace ImageSelector
             if (source == null) return true;
             if (IsDescendantOf(source, SettingsPanel)) return false;
             if (IsDescendantOf(source, HintArea)) return false;
+            if (IsDescendantOf(source, FavView) || IsDescendantOf(source, FavSplitter)) return false;
             if (button == MouseButton.Right && IsDescendantOf(source, PathButtonPanel)) return false;
             return true;
         }
@@ -1159,6 +1345,12 @@ namespace ImageSelector
                 node = GetVisualOrLogicalParent(node);
             }
             return null;
+        }
+
+        private static bool IsPointInside(FrameworkElement element, Point point)
+        {
+            return point.X >= 0 && point.Y >= 0
+                && point.X <= element.ActualWidth && point.Y <= element.ActualHeight;
         }
 
         private static bool IsDescendantOf(DependencyObject? child, DependencyObject? ancestor)
@@ -1193,7 +1385,8 @@ namespace ImageSelector
             if (IsMouseCaptured) ReleaseMouseCapture();
         }
 
-        private Dictionary<string, List<int>> directoryImageIndices = new Dictionary<string, List<int>>();
+        private Dictionary<string, List<int>> directoryImageIndices =
+            new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
         private int currentDirStartIndex;
         private int currentDirEndIndex;
 
@@ -1276,6 +1469,141 @@ namespace ImageSelector
             SettingsPanel.Visibility = 
                 SettingsPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
             CacheSizeSlider.Focusable = false;
+        }
+
+        //---------------------------左侧 fav 分栏-------------------------
+
+        private void ToggleFavPanel()
+        {
+            // 开合前先收掉可能残留的手势/捕获，避免切布局后光标和 capture 粘在旧栏。
+            CancelCanvasGesture();
+            FavView.CancelGesture();
+            CancelFavSplitterDrag();
+
+            if (isFavPanelOpen) CloseFavPanel();
+            else OpenFavPanel();
+        }
+
+        private void OpenFavPanel()
+        {
+            // 右侧还没加载任何媒体时不开一个没东西可拖的空面板。
+            if (string.IsNullOrEmpty(currentImagePath)) return;
+
+            isFavPanelOpen = true;
+            FavView.Visibility = Visibility.Visible;
+            FavSplitter.Visibility = Visibility.Visible;
+            ApplyFavSplitRatio();
+        }
+
+        private void CloseFavPanel()
+        {
+            isFavPanelOpen = false;
+            CancelFavSplitterDrag();
+
+            FavView.Visibility = Visibility.Collapsed;
+            FavSplitter.Visibility = Visibility.Collapsed;
+            FavColumn.Width = new GridLength(0);
+            SplitterColumn.Width = new GridLength(0);
+            FetcherColumn.Width = new GridLength(1, GridUnitType.Star);
+        }
+
+        /// <summary>
+        /// 按当前窗口宽度和记录的比例放置左栏。默认 50/50；
+        /// 限制在 25%–75%，且两边都不小于约 300px。
+        /// </summary>
+        private void ApplyFavSplitRatio()
+        {
+            if (!isFavPanelOpen) return;
+
+            double available = WindowRoot.ActualWidth - FavSplitterWidth;
+            if (available <= 0) return;
+
+            double minLeft = Math.Max(MinPaneWidth, available * MinFavRatio);
+            double maxLeft = Math.Min(available - MinPaneWidth, available * MaxFavRatio);
+            if (minLeft > maxLeft)
+            {
+                // 窗口窄到两边都放不下最小宽度时，居中兜底；MinWidth 已尽量避免走到这里。
+                minLeft = maxLeft = available / 2;
+            }
+
+            double left = Math.Clamp(available * favSplitRatio, minLeft, maxLeft);
+            favSplitRatio = left / available;
+
+            FavColumn.Width = new GridLength(left, GridUnitType.Pixel);
+            SplitterColumn.Width = new GridLength(FavSplitterWidth, GridUnitType.Pixel);
+            FetcherColumn.Width = new GridLength(1, GridUnitType.Star);
+        }
+
+        private void FavSplitter_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (!isFavPanelOpen) return;
+
+            isDraggingFavSplitter = true;
+            Color foreground = settings.GetForegroundColorFromPresetID();
+            FavSplitterLine.Background = new SolidColorBrush(
+                Color.FromArgb(150, foreground.R, foreground.G, foreground.B));
+
+            FavSplitter.CaptureMouse();
+            e.Handled = true;
+        }
+
+        private void FavSplitter_PreviewMouseMove(object sender, MouseEventArgs e)
+        {
+            if (!isDraggingFavSplitter) return;
+
+            double available = WindowRoot.ActualWidth - FavSplitterWidth;
+            if (available <= 0) return;
+
+            double minLeft = Math.Max(MinPaneWidth, available * MinFavRatio);
+            double maxLeft = Math.Min(available - MinPaneWidth, available * MaxFavRatio);
+            if (minLeft > maxLeft) minLeft = maxLeft = available / 2;
+
+            double left = Math.Clamp(e.GetPosition(WindowRoot).X - FavSplitterWidth / 2.0, minLeft, maxLeft);
+            favSplitRatio = left / available;
+
+            FavColumn.Width = new GridLength(left, GridUnitType.Pixel);
+            SplitterColumn.Width = new GridLength(FavSplitterWidth, GridUnitType.Pixel);
+            FetcherColumn.Width = new GridLength(1, GridUnitType.Star);
+            e.Handled = true;
+        }
+
+        private void FavSplitter_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            if (!isDraggingFavSplitter) return;
+
+            isDraggingFavSplitter = false;
+            if (FavSplitter.IsMouseCaptured) FavSplitter.ReleaseMouseCapture();
+            SetFavSplitterHover(FavSplitter.IsMouseOver);
+            e.Handled = true;
+        }
+
+        private void FavSplitter_LostMouseCapture(object sender, MouseEventArgs e)
+        {
+            if (!isDraggingFavSplitter) return;
+            isDraggingFavSplitter = false;
+            SetFavSplitterHover(FavSplitter.IsMouseOver);
+        }
+
+        private void CancelFavSplitterDrag()
+        {
+            if (!isDraggingFavSplitter) return;
+            isDraggingFavSplitter = false;
+            if (FavSplitter.IsMouseCaptured) FavSplitter.ReleaseMouseCapture();
+            SetFavSplitterHover(FavSplitter.IsMouseOver);
+        }
+
+        /// <summary>
+        /// 右侧视口尺寸变化（窗口缩放 / 左右分栏 / 拖分隔条）时，实时重算 fit 基准。
+        /// Scale 仍由用户手势控制：没手动放大时 Scale=1，就是始终贴合新视口。
+        /// </summary>
+        private void HandleFetcherViewportSizeChanged()
+        {
+            if (currentMediaNaturalSize.Width > 0 && currentMediaNaturalSize.Height > 0)
+            {
+                FitMediaToView(currentMediaNaturalSize.Width, currentMediaNaturalSize.Height);
+            }
+            ReclampCanvas();
+            ApplyCanvasTransform();
         }
         private void SetBackgroundColor_Click(object sender, RoutedEventArgs e)
         {
