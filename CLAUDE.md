@@ -18,13 +18,15 @@ dotnet build
 dotnet build --configuration Release
 
 # Publish standalone executable
-dotnet publish -c Release -r win-x64 --self-contained false
+dotnet publish Fetcher/Fetcher.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o dist
 
 # Clean build artifacts
 dotnet clean
 ```
 
 **Build Output**: `Fetcher/bin/Release/net9.0-windows/`
+
+**Release Output**: `dist/Fetcher.exe` — designated release folder (gitignored). When the user says 发版 / release, publish here.
 
 ## Architecture
 

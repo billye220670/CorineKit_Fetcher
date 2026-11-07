@@ -42,10 +42,12 @@ dotnet rebuild
 
 ### Publish Application
 ```bash
-dotnet publish -c Release -r win-x64 --self-contained false
+dotnet publish Fetcher/Fetcher.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o dist
 ```
 
-**Output Location:** `Fetcher/bin/Release/net9.0-windows/`
+**Output Location:** `dist/Fetcher.exe`
+
+`dist/` is the designated release folder (gitignored). Whenever the user says 发版 / release, publish the single-file exe here — do not ship `Fetcher/bin/` output.
 
 ---
 
