@@ -66,6 +66,9 @@ namespace ImageSelector
 
         //---------------------------右侧画布动作录制/回放-------------------------
         private const double MotionClickSlop = 8.0;
+        // 左键先按时，右键必须在这段时间内跟上才算同一组双键手势，
+        // 避免"左键按住半天后再按右键"被误判成停止/录制。
+        private const double MotionPairWindowMs = 400.0;
         private readonly CanvasMotionPlayer rightMotion = new CanvasMotionPlayer();
         private readonly Stopwatch motionClock = Stopwatch.StartNew();
         private TimeSpan lastMotionFrame;
@@ -77,6 +80,12 @@ namespace ImageSelector
         private Point rightMotionLastPoint;
         private double rightMotionAccumX;
         private double rightMotionAccumY;
+
+        // 左键先按：记录起点与时刻，右键在窗口内跟上才升级为双键手势；
+        // 同时给文件拖出加位移阈值，避免点击时的抖动直接开始拖拽。
+        private bool hasLeftDownForMotion;
+        private Point leftDownForMotion;
+        private TimeSpan leftDownForMotionTime;
 
         private bool IsAnyMotionCapturing =>
             isRightMotionCandidate || isRightMotionRecording || FavView.IsMotionCapturing;
@@ -257,11 +266,23 @@ namespace ImageSelector
             // 右键 / 中键正在做画布手势时，不要触发文件拖放；
             // 右键按住时左键也可能是录制的第二根手指。
             if (Mouse.RightButton == MouseButtonState.Pressed) return;
+            if (IsAnyMotionCapturing) return;
             if (pendingGestureButton.HasValue || isPanning) return;
 
             if (e.LeftButton == MouseButtonState.Pressed && !string.IsNullOrEmpty(currentImagePath))
             {
+                // 左键先按可能是在等右键组成双键手势；只有真的移动过阈值才拖出文件。
+                if (!hasLeftDownForMotion) return;
+                Point position = e.GetPosition(RootGrid);
+                double threshold = MotionGestureThreshold();
+                if (Math.Abs(position.X - leftDownForMotion.X) < threshold &&
+                    Math.Abs(position.Y - leftDownForMotion.Y) < threshold)
+                {
+                    return;
+                }
+
                 // 开始拖动操作。拖拽期间置位，Drop 里据此区分“右→左收藏”和外部拖入。
+                hasLeftDownForMotion = false;
                 isRightDraggingOut = true;
                 try
                 {
@@ -1188,8 +1209,8 @@ namespace ImageSelector
 
         //---------------------------右键 / 中键手势-------------------------
         // 右键：按住 = 暂停播放；按住 + 拖拽 = 平移；松手 = 从暂停相位续播。
-        // 右键保持时再按左键（双键位移过阈值）= 录制画布动作；松左键结束。
-        // 双键 click（位移低于阈值）= 停止播放；F = fit。右键不再复位。
+        // 双键（右键先按，或左键先按后 400ms 内右键跟上）：位移过阈值 = 录制画布动作，
+        // 松左键结束；双键 click（位移低于阈值）= 停止播放；F = fit。右键不再复位。
         // 中键：按住 + 拖拽 = 平移，原地单击 = 沿用旧逻辑（面包屑开资源管理器 / 图片开默认程序）
 
         private void Window_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
@@ -1269,12 +1290,23 @@ namespace ImageSelector
 
             if (e.ChangedButton == MouseButton.Left)
             {
+                Point leftDown = e.GetPosition(RootGrid);
+
+                // 先只记录，不劫持：右键在短窗口内跟上才升级为双键手势。
+                if (IsPointInside(RootGrid, leftDown)
+                    && CanStartMotionLeftDown(e.OriginalSource as DependencyObject))
+                {
+                    hasLeftDownForMotion = true;
+                    leftDownForMotion = leftDown;
+                    leftDownForMotionTime = motionClock.Elapsed;
+                }
+
                 // 右键 pan 保持时再按左键：进入录制候选。位移过阈值才正式录。
                 if (pendingGestureButton == MouseButton.Right
                     && !isRightMotionCandidate && !isRightMotionRecording
-                    && IsPointInside(RootGrid, e.GetPosition(RootGrid)))
+                    && IsPointInside(RootGrid, leftDown))
                 {
-                    BeginRightMotionCandidate(e.GetPosition(RootGrid));
+                    BeginRightMotionCandidate(leftDown);
                     e.Handled = true;
                 }
                 return;
@@ -1292,6 +1324,16 @@ namespace ImageSelector
                 // 右键按住 = 暂停播放；松开时若没有进入停止/录制，再续播。
                 rightMotion.Pause();
                 isRightPanEnded = false;
+
+                // 左键先按住、右键在短窗口内跟上：同样进入双键候选。
+                // 候选以右键按下的位置为锚点，左键按下后的抖动不计入阈值。
+                Point rightDown = e.GetPosition(RootGrid);
+                if (TryArmLeftFirstMotion(rightDown))
+                {
+                    BeginRightMotionCandidate(rightDown);
+                    // 这次左键不再作为双击打开的第一击。
+                    lastClickTime = DateTime.MinValue;
+                }
             }
 
             pendingGestureButton = e.ChangedButton;
@@ -1343,6 +1385,8 @@ namespace ImageSelector
 
         private void Window_PreviewMouseUp(object sender, MouseButtonEventArgs e)
         {
+            if (e.ChangedButton == MouseButton.Left) hasLeftDownForMotion = false;
+
             if (e.ChangedButton == MouseButton.Left
                 && (isRightMotionCandidate || isRightMotionRecording))
             {
@@ -1401,6 +1445,41 @@ namespace ImageSelector
             double system = Math.Max(SystemParameters.MinimumHorizontalDragDistance,
                                      SystemParameters.MinimumVerticalDragDistance);
             return Math.Max(MotionClickSlop, system * 2);
+        }
+
+        /// <summary>
+        /// 左键先按是否够格升级为双键手势：左键仍按着、两键间隔在窗口内、
+        /// 期间没有明显位移，且不是从设置/提示/面包屑上按下的。
+        /// </summary>
+        private bool TryArmLeftFirstMotion(Point rightPosition)
+        {
+            if (pendingGestureButton.HasValue || isRightMotionCandidate || isRightMotionRecording)
+            {
+                return false;
+            }
+            if (Mouse.LeftButton != MouseButtonState.Pressed || !hasLeftDownForMotion)
+            {
+                return false;
+            }
+
+            double elapsedMs = (motionClock.Elapsed - leftDownForMotionTime).TotalMilliseconds;
+            if (elapsedMs < 0 || elapsedMs > MotionPairWindowMs)
+            {
+                return false;
+            }
+
+            double threshold = MotionGestureThreshold();
+            return Math.Abs(rightPosition.X - leftDownForMotion.X) < threshold
+                && Math.Abs(rightPosition.Y - leftDownForMotion.Y) < threshold;
+        }
+
+        private bool CanStartMotionLeftDown(DependencyObject? source)
+        {
+            if (source == null) return true;
+            if (IsDescendantOf(source, SettingsPanel)) return false;
+            if (IsDescendantOf(source, HintArea)) return false;
+            if (IsDescendantOf(source, PathButtonPanel)) return false;
+            return true;
         }
 
         private void BeginRightMotionCandidate(Point position)
@@ -1501,6 +1580,7 @@ namespace ImageSelector
 
         private void CancelRightMotionGesture()
         {
+            hasLeftDownForMotion = false;
             if (isRightMotionRecording)
             {
                 rightMotion.GetOffsetPixels(RootGrid.ActualHeight, out double overlayX, out double overlayY);
@@ -1535,6 +1615,7 @@ namespace ImageSelector
 
         private void CancelCanvasGesture()
         {
+            hasLeftDownForMotion = false;
             if (pendingGestureButton.HasValue || isPanning)
             {
                 EndCanvasGesture();
