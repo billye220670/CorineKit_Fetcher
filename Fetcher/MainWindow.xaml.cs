@@ -64,6 +64,23 @@ namespace ImageSelector
         private bool isDraggingFavSplitter;
         private bool isRightDraggingOut;
 
+        //---------------------------右侧画布动作录制/回放-------------------------
+        private const double MotionClickSlop = 8.0;
+        private readonly CanvasMotionPlayer rightMotion = new CanvasMotionPlayer();
+        private readonly Stopwatch motionClock = Stopwatch.StartNew();
+        private TimeSpan lastMotionFrame;
+        private bool isRightMotionCandidate;
+        private bool isRightMotionRecording;
+        private bool isRightPanEnded;
+        private Point rightMotionCandidateStart;
+        private TimeSpan rightMotionStartTime;
+        private Point rightMotionLastPoint;
+        private double rightMotionAccumX;
+        private double rightMotionAccumY;
+
+        private bool IsAnyMotionCapturing =>
+            isRightMotionCandidate || isRightMotionRecording || FavView.IsMotionCapturing;
+
         // 右键 / 中键手势：按下后先不判定，位移越过阈值才算 drag，否则算 click
         private MouseButton? pendingGestureButton;
         private Button? pendingGesturePathButton;     // 中键按下时命中的面包屑按钮（可能为 null）
@@ -103,6 +120,8 @@ namespace ImageSelector
             // 表现就是关窗后"未响应"。TeardownMedia → StopVideo 的顺序已经是对的。
             Closing += (s, e) => {
                 settings.Save();
+                CompositionTarget.Rendering -= OnMotionFrame;
+                rightMotion.Reset();
                 FavView.Shutdown();
                 TeardownMedia();
                 gifPlayer.Dispose();
@@ -129,10 +148,13 @@ namespace ImageSelector
             Deactivated += (s, e) =>
             {
                 CancelCanvasGesture();
+                CancelRightMotionGesture();
                 FavView.CancelGesture();
                 CancelFavSplitterDrag();
             };
 
+            lastMotionFrame = motionClock.Elapsed;
+            CompositionTarget.Rendering += OnMotionFrame;
             loaded = true;
         }
 
@@ -232,7 +254,9 @@ namespace ImageSelector
         //---------------------------鼠标拖拽图片-------------------------
         private void Window_MouseMove(object sender, MouseEventArgs e)
         {
-            // 右键 / 中键正在做画布手势时，不要触发文件拖放
+            // 右键 / 中键正在做画布手势时，不要触发文件拖放；
+            // 右键按住时左键也可能是录制的第二根手指。
+            if (Mouse.RightButton == MouseButtonState.Pressed) return;
             if (pendingGestureButton.HasValue || isPanning) return;
 
             if (e.LeftButton == MouseButtonState.Pressed && !string.IsNullOrEmpty(currentImagePath))
@@ -253,6 +277,7 @@ namespace ImageSelector
         //---------------------------拖放图片进入APP-------------------------
         private void Window_Drop(object sender, DragEventArgs e)
         {
+            if (IsAnyMotionCapturing) return;
             if (!e.Data.GetDataPresent(DataFormats.FileDrop)) return;
 
             if (e.Data.GetData(DataFormats.FileDrop) is not string[] filePaths || filePaths.Length == 0) return;
@@ -752,6 +777,7 @@ namespace ImageSelector
         private void Media_MouseDown(object sender, MouseButtonEventArgs e)
         {
             if (e.ChangedButton != MouseButton.Left) return;
+            if (Mouse.RightButton == MouseButtonState.Pressed) return;
 
             if ((DateTime.Now - lastClickTime).TotalMilliseconds <= doubleClickInterval)
             {
@@ -969,12 +995,23 @@ namespace ImageSelector
         private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
         {
             if (e.Key != Key.Space) return;
+            if (IsAnyMotionCapturing)
+            {
+                e.Handled = true;
+                return;
+            }
             if (!e.IsRepeat) ToggleFavPanel();
             e.Handled = true;
         }
 
         private void Window_KeyDown(object sender, KeyEventArgs e)
         {
+            if (IsAnyMotionCapturing)
+            {
+                e.Handled = true;
+                return;
+            }
+
             switch (e.Key)
             {
                 case Key.Left:
@@ -1035,17 +1072,19 @@ namespace ImageSelector
 
         private void ApplyCanvasTransform()
         {
+            rightMotion.GetOffsetPixels(RootGrid.ActualHeight, out double motionX, out double motionY);
+
             CanvasScaleTransform.ScaleX = canvas.Scale;
             CanvasScaleTransform.ScaleY = canvas.Scale;
-            CanvasTranslateTransform.X = canvas.OffsetX;
-            CanvasTranslateTransform.Y = canvas.OffsetY;
+            CanvasTranslateTransform.X = canvas.OffsetX + motionX;
+            CanvasTranslateTransform.Y = canvas.OffsetY + motionY;
 
             // 视频层有自己的一份 Transform（两个元素共用同一个未冻结的 Freezable 容易踩
             // 继承上下文的坑），所以同样的值再写一遍。隐藏的那层写了也不渲染，不亏。
             VideoScaleTransform.ScaleX = canvas.Scale;
             VideoScaleTransform.ScaleY = canvas.Scale;
-            VideoTranslateTransform.X = canvas.OffsetX;
-            VideoTranslateTransform.Y = canvas.OffsetY;
+            VideoTranslateTransform.X = canvas.OffsetX + motionX;
+            VideoTranslateTransform.Y = canvas.OffsetY + motionY;
         }
 
         private void ResetCanvasTransform()
@@ -1062,6 +1101,9 @@ namespace ImageSelector
         /// </summary>
         private void RefitCanvas()
         {
+            // F：真正回到 fit 必须把运动 overlay 也归零，否则 base 复位了、
+            // 循环偏移还在，画面仍然不是 fit。
+            rightMotion.FitReset();
             if (currentMediaNaturalSize.Width > 0 && currentMediaNaturalSize.Height > 0)
             {
                 FitMediaToView(currentMediaNaturalSize.Width, currentMediaNaturalSize.Height);
@@ -1110,8 +1152,12 @@ namespace ImageSelector
         private void ZoomCanvasAt(Point mouseInGrid, double factor)
         {
             CanvasViewState.Layout layout = GetCanvasLayout();
+
+            // 当前视觉 = base + motion overlay。缩放只改 base，所以锚点要把
+            // 已经叠加的运动偏移扣掉，光标下的像素才会真的不动。
+            rightMotion.GetOffsetPixels(RootGrid.ActualHeight, out double motionX, out double motionY);
             CanvasViewState next = canvas
-                .ZoomAt(layout, mouseInGrid.X, mouseInGrid.Y, factor)
+                .ZoomAt(layout, mouseInGrid.X - motionX, mouseInGrid.Y - motionY, factor)
                 .Clamp(layout, PanEdgeMargin);
 
             if (next.Equals(canvas)) return;
@@ -1141,11 +1187,20 @@ namespace ImageSelector
         }
 
         //---------------------------右键 / 中键手势-------------------------
-        // 右键：按住 + 滚轮 = 缩放，按住 + 拖拽 = 平移，原地单击 = 画布复位
+        // 右键：按住 = 暂停播放；按住 + 拖拽 = 平移；松手 = 从暂停相位续播。
+        // 右键保持时再按左键（双键位移过阈值）= 录制画布动作；松左键结束。
+        // 双键 click（位移低于阈值）= 停止播放；F = fit。右键不再复位。
         // 中键：按住 + 拖拽 = 平移，原地单击 = 沿用旧逻辑（面包屑开资源管理器 / 图片开默认程序）
 
         private void Window_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
         {
+            // 录制期间锁掉所有滚轮：不缩放，也不切图/fav。
+            if (IsAnyMotionCapturing)
+            {
+                e.Handled = true;
+                return;
+            }
+
             // 按位置分区，而不是只看 OriginalSource：左栏 / 分隔条上的滚轮归左栏，
             // 即使右栏手势状态因为某种原因没清干净，也不能把它抢过来。
             if (!IsPointInside(RootGrid, e.GetPosition(RootGrid))) return;
@@ -1206,12 +1261,38 @@ namespace ImageSelector
         private void Window_PreviewMouseDown(object sender, MouseButtonEventArgs e)
         {
             if (e.ButtonState != MouseButtonState.Pressed) return;
+            if (IsAnyMotionCapturing && e.ChangedButton == MouseButton.Middle)
+            {
+                e.Handled = true;
+                return;
+            }
+
+            if (e.ChangedButton == MouseButton.Left)
+            {
+                // 右键 pan 保持时再按左键：进入录制候选。位移过阈值才正式录。
+                if (pendingGestureButton == MouseButton.Right
+                    && !isRightMotionCandidate && !isRightMotionRecording
+                    && IsPointInside(RootGrid, e.GetPosition(RootGrid)))
+                {
+                    BeginRightMotionCandidate(e.GetPosition(RootGrid));
+                    e.Handled = true;
+                }
+                return;
+            }
+
             if (e.ChangedButton != MouseButton.Right && e.ChangedButton != MouseButton.Middle) return;
 
             // 右键/中键画布手势只属于右侧 Fetcher 视口。用位置判定兜底，避免
             // OriginalSource 落在 MediaElement 模板里时误判成右栏，从左侧抢走 capture。
             if (!IsPointInside(RootGrid, e.GetPosition(RootGrid))) return;
             if (!CanStartCanvasGesture(e.OriginalSource as DependencyObject, e.ChangedButton)) return;
+
+            if (e.ChangedButton == MouseButton.Right)
+            {
+                // 右键按住 = 暂停播放；松开时若没有进入停止/录制，再续播。
+                rightMotion.Pause();
+                isRightPanEnded = false;
+            }
 
             pendingGestureButton = e.ChangedButton;
             // 捕获鼠标后 OriginalSource 不再可靠，面包屑命中结果必须在按下时就记下来
@@ -1229,6 +1310,13 @@ namespace ImageSelector
 
         private void Window_PreviewMouseMove(object sender, MouseEventArgs e)
         {
+            if (isRightMotionCandidate || isRightMotionRecording)
+            {
+                HandleRightMotionMove(e.GetPosition(RootGrid));
+                e.Handled = true;
+                return;
+            }
+
             if (!pendingGestureButton.HasValue) return;
 
             Point position = e.GetPosition(RootGrid);
@@ -1255,12 +1343,38 @@ namespace ImageSelector
 
         private void Window_PreviewMouseUp(object sender, MouseButtonEventArgs e)
         {
+            if (e.ChangedButton == MouseButton.Left
+                && (isRightMotionCandidate || isRightMotionRecording))
+            {
+                FinishRightMotionGesture(e.GetPosition(RootGrid));
+                e.Handled = true;
+                return;
+            }
+
+            if (e.ChangedButton == MouseButton.Right
+                && (isRightMotionCandidate || isRightMotionRecording))
+            {
+                // 右键先松：pan 结束，但录制保持到左键松；capture 留着接左键 up。
+                isRightPanEnded = true;
+                pendingGestureButton = null;
+                isPanning = false;
+                Cursor = null;
+                e.Handled = true;
+                return;
+            }
+
             if (!pendingGestureButton.HasValue || e.ChangedButton != pendingGestureButton.Value) return;
 
             MouseButton button = pendingGestureButton.Value;
             Button? pathButton = pendingGesturePathButton;
             bool wasDrag = isPanning;
             EndCanvasGesture();
+
+            if (button == MouseButton.Right)
+            {
+                // 右键单击不再复位；按住只负责暂停，松手续播。
+                rightMotion.Resume();
+            }
 
             if (wasDrag)
             {
@@ -1274,17 +1388,149 @@ namespace ImageSelector
                 HandleMiddleClick(pathButton);
                 e.Handled = true;
             }
-            else if (button == MouseButton.Right)
-            {
-                // 右键原地单击：与 F 键一致，重新适配窗口并复位画布
-                RefitCanvas();
-                e.Handled = true;
-            }
         }
 
         private void Window_LostMouseCapture(object sender, MouseEventArgs e)
         {
+            if (isRightMotionCandidate || isRightMotionRecording) CancelRightMotionGesture();
             CancelCanvasGesture();
+        }
+
+        private static double MotionGestureThreshold()
+        {
+            double system = Math.Max(SystemParameters.MinimumHorizontalDragDistance,
+                                     SystemParameters.MinimumVerticalDragDistance);
+            return Math.Max(MotionClickSlop, system * 2);
+        }
+
+        private void BeginRightMotionCandidate(Point position)
+        {
+            isRightMotionCandidate = true;
+            isRightMotionRecording = false;
+            isRightPanEnded = false;
+            rightMotionCandidateStart = position;
+            rightMotionLastPoint = position;
+            rightMotionAccumX = 0;
+            rightMotionAccumY = 0;
+        }
+
+        private void HandleRightMotionMove(Point position)
+        {
+            if (isRightPanEnded) return;
+
+            if (!isRightMotionRecording)
+            {
+                double dxTotal = position.X - rightMotionCandidateStart.X;
+                double dyTotal = position.Y - rightMotionCandidateStart.Y;
+                double threshold = MotionGestureThreshold();
+                if (Math.Abs(dxTotal) < threshold && Math.Abs(dyTotal) < threshold) return;
+
+                // 新录制替换旧 clip。先把当前 overlay 吸收进 base，视觉不跳；
+                // 然后从当前指针位置开始录。
+                rightMotion.GetOffsetPixels(RootGrid.ActualHeight, out double overlayX, out double overlayY);
+                if (Math.Abs(overlayX) > 0.01 || Math.Abs(overlayY) > 0.01)
+                {
+                    canvas = canvas.PanBy(overlayX, overlayY);
+                }
+
+                rightMotion.BeginRecording();
+                isRightMotionCandidate = false;
+                isRightMotionRecording = true;
+                rightMotionLastPoint = position;
+                rightMotionStartTime = motionClock.Elapsed;
+                rightMotionAccumX = 0;
+                rightMotionAccumY = 0;
+                RightMotionRecordingBorder.Visibility = Visibility.Visible;
+                ApplyCanvasTransform();
+                return;
+            }
+
+            double height = Math.Max(1, RootGrid.ActualHeight);
+            double dx = (position.X - rightMotionLastPoint.X) / height;
+            double dy = (position.Y - rightMotionLastPoint.Y) / height;
+            rightMotionLastPoint = position;
+            rightMotionAccumX += dx;
+            rightMotionAccumY += dy;
+
+            double time = (motionClock.Elapsed - rightMotionStartTime).TotalSeconds;
+            rightMotion.AddSample(time, rightMotionAccumX, rightMotionAccumY);
+            ApplyCanvasTransform();
+        }
+
+        private void FinishRightMotionGesture(Point position)
+        {
+            bool wasRecording = isRightMotionRecording;
+            bool rightStillHeld = pendingGestureButton == MouseButton.Right;
+
+            isRightMotionCandidate = false;
+            isRightMotionRecording = false;
+            RightMotionRecordingBorder.Visibility = Visibility.Collapsed;
+
+            if (wasRecording)
+            {
+                rightMotion.EndRecording();
+                if (rightStillHeld) rightMotion.Pause();
+            }
+            else
+            {
+                // 双键 click：停止；没有 clip 时是空操作。
+                rightMotion.Stop();
+            }
+
+            if (rightStillHeld)
+            {
+                // 右键还按着：pan 从当前指针位置继续；播放先保持暂停。
+                isRightPanEnded = false;
+                pendingGestureButton = MouseButton.Right;
+                isPanning = true;
+                lastPanPos = position;
+                gestureStartPos = position;
+                Cursor = Cursors.SizeAll;
+            }
+            else
+            {
+                isRightPanEnded = false;
+                pendingGestureButton = null;
+                isPanning = false;
+                Cursor = null;
+                if (IsMouseCaptured) ReleaseMouseCapture();
+            }
+
+            ApplyCanvasTransform();
+        }
+
+        private void CancelRightMotionGesture()
+        {
+            if (isRightMotionRecording)
+            {
+                rightMotion.GetOffsetPixels(RootGrid.ActualHeight, out double overlayX, out double overlayY);
+                if (Math.Abs(overlayX) > 0.01 || Math.Abs(overlayY) > 0.01)
+                {
+                    canvas = canvas.PanBy(overlayX, overlayY);
+                }
+                rightMotion.CancelRecording();
+                ApplyCanvasTransform();
+            }
+
+            isRightMotionCandidate = false;
+            isRightMotionRecording = false;
+            isRightPanEnded = false;
+            RightMotionRecordingBorder.Visibility = Visibility.Collapsed;
+        }
+
+        private void OnMotionFrame(object? sender, EventArgs e)
+        {
+            TimeSpan now = motionClock.Elapsed;
+            double dt = (now - lastMotionFrame).TotalSeconds;
+            lastMotionFrame = now;
+
+            if (rightMotion.IsPlaying)
+            {
+                rightMotion.Update(dt);
+                ApplyCanvasTransform();
+            }
+
+            FavView.UpdateMotion(dt);
         }
 
         private void CancelCanvasGesture()

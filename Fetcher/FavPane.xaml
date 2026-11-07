@@ -54,5 +54,10 @@
                 </TransformGroup>
             </MediaElement.RenderTransform>
         </MediaElement>
+
+        <Border x:Name="FavMotionRecordingBorder"
+                BorderBrush="Red" BorderThickness="2"
+                IsHitTestVisible="False"
+                Visibility="Collapsed" />
     </Grid>
 </UserControl>

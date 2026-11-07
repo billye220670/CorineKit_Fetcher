@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
@@ -41,6 +42,22 @@ namespace ImageSelector
         private bool isVideoPaused;
         private bool resumeGifAfterShow;
         private bool resumeVideoAfterShow;
+
+        //---------------------------画布动作录制/回放-------------------------
+        private const double MotionClickSlop = 8.0;
+        private readonly CanvasMotionPlayer motion = new CanvasMotionPlayer();
+        private readonly Stopwatch motionClock = Stopwatch.StartNew();
+        private bool isMotionCandidate;
+        private bool isMotionRecording;
+        private bool isRightPanEnded;
+        private Point motionCandidateStart;
+        private TimeSpan motionStartTime;
+        private Point motionLastPoint;
+        private double motionAccumX;
+        private double motionAccumY;
+        private bool resumeMotionAfterShow;
+
+        public bool IsMotionCapturing => isMotionCandidate || isMotionRecording;
 
         public FavPane()
         {
@@ -162,6 +179,7 @@ namespace ImageSelector
         /// <summary>F 键 / 右键单击：按当前视口重新适配并复位画布。</summary>
         public void Refit()
         {
+            motion.FitReset();
             if (naturalSize.Width > 0 && naturalSize.Height > 0)
             {
                 FitMediaToView(naturalSize.Width, naturalSize.Height);
@@ -172,6 +190,7 @@ namespace ImageSelector
         /// <summary>P 键：仅在当前媒体是 GIF / 视频时有意义。</summary>
         public void CancelGesture()
         {
+            CancelMotionGesture();
             if (pendingGestureButton.HasValue || isPanning)
             {
                 EndGesture();
@@ -208,12 +227,22 @@ namespace ImageSelector
         /// <summary>窗口关闭：停媒体、释放替身与流。fav 列表本身不落盘。</summary>
         public void Shutdown()
         {
+            motion.Reset();
+            FavMotionRecordingBorder.Visibility = Visibility.Collapsed;
             TeardownMedia();
             gifPlayer.Dispose();
             videoResolver.Dispose();
             favorites.Clear();
             favoriteLookup.Clear();
             currentIndex = -1;
+        }
+
+        /// <summary>由窗口的统一渲染循环驱动；左右各自一份状态。</summary>
+        public void UpdateMotion(double dt)
+        {
+            if (!motion.IsPlaying) return;
+            motion.Update(dt);
+            ApplyCanvasTransform();
         }
 
         private void DisplayFavorite(int index)
@@ -414,8 +443,28 @@ namespace ImageSelector
 
         private void FavPane_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
         {
-            if (IsVisible) ResumePlayback();
-            else SuspendPlayback();
+            if (IsVisible)
+            {
+                ResumePlayback();
+                if (resumeMotionAfterShow)
+                {
+                    resumeMotionAfterShow = false;
+                    motion.Resume();
+                }
+            }
+            else
+            {
+                SuspendPlayback();
+                if (motion.IsPlaying)
+                {
+                    resumeMotionAfterShow = true;
+                    motion.Pause();
+                }
+                else
+                {
+                    resumeMotionAfterShow = false;
+                }
+            }
         }
 
         private void SuspendPlayback()
@@ -467,15 +516,17 @@ namespace ImageSelector
 
         private void ApplyCanvasTransform()
         {
+            motion.GetOffsetPixels(PaneRoot.ActualHeight, out double motionX, out double motionY);
+
             FavImageScaleTransform.ScaleX = canvas.Scale;
             FavImageScaleTransform.ScaleY = canvas.Scale;
-            FavImageTranslateTransform.X = canvas.OffsetX;
-            FavImageTranslateTransform.Y = canvas.OffsetY;
+            FavImageTranslateTransform.X = canvas.OffsetX + motionX;
+            FavImageTranslateTransform.Y = canvas.OffsetY + motionY;
 
             FavVideoScaleTransform.ScaleX = canvas.Scale;
             FavVideoScaleTransform.ScaleY = canvas.Scale;
-            FavVideoTranslateTransform.X = canvas.OffsetX;
-            FavVideoTranslateTransform.Y = canvas.OffsetY;
+            FavVideoTranslateTransform.X = canvas.OffsetX + motionX;
+            FavVideoTranslateTransform.Y = canvas.OffsetY + motionY;
         }
 
         private void ResetCanvasTransform()
@@ -545,8 +596,11 @@ namespace ImageSelector
         private void ZoomCanvasAt(Point mouseInPane, double factor)
         {
             CanvasViewState.Layout layout = GetCanvasLayout();
+
+            // 视觉 = base + motion overlay；缩放只改 base，锚点扣掉 overlay。
+            motion.GetOffsetPixels(PaneRoot.ActualHeight, out double motionX, out double motionY);
             CanvasViewState next = canvas
-                .ZoomAt(layout, mouseInPane.X, mouseInPane.Y, factor)
+                .ZoomAt(layout, mouseInPane.X - motionX, mouseInPane.Y - motionY, factor)
                 .Clamp(layout, PanEdgeMargin);
 
             if (next.Equals(canvas)) return;
@@ -576,6 +630,12 @@ namespace ImageSelector
 
         private void Pane_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
         {
+            if (IsMotionCapturing)
+            {
+                e.Handled = true;
+                return;
+            }
+
             if (pendingGestureButton == MouseButton.Right)
             {
                 ZoomCanvasAt(e.GetPosition(PaneRoot), CanvasViewState.WheelToFactor(e.Delta));
@@ -601,8 +661,26 @@ namespace ImageSelector
 
         private void Pane_PreviewMouseDown(object sender, MouseButtonEventArgs e)
         {
-            if (e.ChangedButton != MouseButton.Right) return;
             if (e.ButtonState != MouseButtonState.Pressed) return;
+
+            if (e.ChangedButton == MouseButton.Left)
+            {
+                Point leftDown = e.GetPosition(PaneRoot);
+                if (pendingGestureButton == MouseButton.Right && !IsMotionCapturing
+                    && leftDown.X >= 0 && leftDown.Y >= 0
+                    && leftDown.X <= PaneRoot.ActualWidth && leftDown.Y <= PaneRoot.ActualHeight)
+                {
+                    BeginMotionCandidate(leftDown);
+                    e.Handled = true;
+                }
+                return;
+            }
+
+            if (e.ChangedButton != MouseButton.Right) return;
+
+            // 右键按住 = 暂停播放；松开时若没进入停止/录制，再续播。
+            motion.Pause();
+            isRightPanEnded = false;
 
             pendingGestureButton = MouseButton.Right;
             gestureStartPos = e.GetPosition(PaneRoot);
@@ -618,6 +696,13 @@ namespace ImageSelector
 
         private void Pane_PreviewMouseMove(object sender, MouseEventArgs e)
         {
+            if (IsMotionCapturing)
+            {
+                HandleMotionMove(e.GetPosition(PaneRoot));
+                e.Handled = true;
+                return;
+            }
+
             if (!pendingGestureButton.HasValue) return;
 
             Point position = e.GetPosition(PaneRoot);
@@ -643,21 +728,163 @@ namespace ImageSelector
 
         private void Pane_PreviewMouseUp(object sender, MouseButtonEventArgs e)
         {
+            if (e.ChangedButton == MouseButton.Left && IsMotionCapturing)
+            {
+                FinishMotionGesture(e.GetPosition(PaneRoot));
+                e.Handled = true;
+                return;
+            }
+
+            if (e.ChangedButton == MouseButton.Right && IsMotionCapturing)
+            {
+                isRightPanEnded = true;
+                pendingGestureButton = null;
+                isPanning = false;
+                Cursor = null;
+                e.Handled = true;
+                return;
+            }
+
             if (!pendingGestureButton.HasValue || e.ChangedButton != pendingGestureButton.Value) return;
 
+            MouseButton button = pendingGestureButton.Value;
             bool wasDrag = isPanning;
             EndGesture();
 
-            if (!wasDrag && e.ChangedButton == MouseButton.Right)
+            if (button == MouseButton.Right)
             {
-                Refit();
+                // 右键单击不再复位；按住只负责暂停，松手续播。
+                motion.Resume();
+            }
+
+            if (!wasDrag && button == MouseButton.Right)
+            {
                 e.Handled = true;
             }
         }
 
         private void Pane_LostMouseCapture(object sender, MouseEventArgs e)
         {
+            if (IsMotionCapturing) CancelMotionGesture();
             if (pendingGestureButton.HasValue) EndGesture();
+        }
+
+        private static double MotionGestureThreshold()
+        {
+            double system = Math.Max(SystemParameters.MinimumHorizontalDragDistance,
+                                     SystemParameters.MinimumVerticalDragDistance);
+            return Math.Max(MotionClickSlop, system * 2);
+        }
+
+        private void BeginMotionCandidate(Point position)
+        {
+            isMotionCandidate = true;
+            isMotionRecording = false;
+            isRightPanEnded = false;
+            motionCandidateStart = position;
+            motionLastPoint = position;
+            motionAccumX = 0;
+            motionAccumY = 0;
+        }
+
+        private void HandleMotionMove(Point position)
+        {
+            if (isRightPanEnded) return;
+
+            if (!isMotionRecording)
+            {
+                double dxTotal = position.X - motionCandidateStart.X;
+                double dyTotal = position.Y - motionCandidateStart.Y;
+                double threshold = MotionGestureThreshold();
+                if (Math.Abs(dxTotal) < threshold && Math.Abs(dyTotal) < threshold) return;
+
+                motion.GetOffsetPixels(PaneRoot.ActualHeight, out double overlayX, out double overlayY);
+                if (Math.Abs(overlayX) > 0.01 || Math.Abs(overlayY) > 0.01)
+                {
+                    canvas = canvas.PanBy(overlayX, overlayY);
+                }
+
+                motion.BeginRecording();
+                isMotionCandidate = false;
+                isMotionRecording = true;
+                motionLastPoint = position;
+                motionStartTime = motionClock.Elapsed;
+                motionAccumX = 0;
+                motionAccumY = 0;
+                FavMotionRecordingBorder.Visibility = Visibility.Visible;
+                ApplyCanvasTransform();
+                return;
+            }
+
+            double height = Math.Max(1, PaneRoot.ActualHeight);
+            double dx = (position.X - motionLastPoint.X) / height;
+            double dy = (position.Y - motionLastPoint.Y) / height;
+            motionLastPoint = position;
+            motionAccumX += dx;
+            motionAccumY += dy;
+
+            double time = (motionClock.Elapsed - motionStartTime).TotalSeconds;
+            motion.AddSample(time, motionAccumX, motionAccumY);
+            ApplyCanvasTransform();
+        }
+
+        private void FinishMotionGesture(Point position)
+        {
+            bool wasRecording = isMotionRecording;
+            bool rightStillHeld = pendingGestureButton == MouseButton.Right;
+
+            isMotionCandidate = false;
+            isMotionRecording = false;
+            FavMotionRecordingBorder.Visibility = Visibility.Collapsed;
+
+            if (wasRecording)
+            {
+                motion.EndRecording();
+                if (rightStillHeld) motion.Pause();
+            }
+            else
+            {
+                motion.Stop();
+            }
+
+            if (rightStillHeld)
+            {
+                isRightPanEnded = false;
+                pendingGestureButton = MouseButton.Right;
+                isPanning = true;
+                lastPanPos = position;
+                gestureStartPos = position;
+                Cursor = Cursors.SizeAll;
+            }
+            else
+            {
+                isRightPanEnded = false;
+                pendingGestureButton = null;
+                isPanning = false;
+                Cursor = null;
+                if (PaneRoot.IsMouseCaptured) PaneRoot.ReleaseMouseCapture();
+            }
+
+            ApplyCanvasTransform();
+        }
+
+        private void CancelMotionGesture()
+        {
+            if (isMotionRecording)
+            {
+                motion.GetOffsetPixels(PaneRoot.ActualHeight, out double overlayX, out double overlayY);
+                if (Math.Abs(overlayX) > 0.01 || Math.Abs(overlayY) > 0.01)
+                {
+                    canvas = canvas.PanBy(overlayX, overlayY);
+                }
+                motion.CancelRecording();
+                ApplyCanvasTransform();
+            }
+
+            isMotionCandidate = false;
+            isMotionRecording = false;
+            isRightPanEnded = false;
+            FavMotionRecordingBorder.Visibility = Visibility.Collapsed;
         }
 
         private void EndGesture()
@@ -673,7 +900,8 @@ namespace ImageSelector
         private void FavMedia_MouseMove(object sender, MouseEventArgs e)
         {
             if (e.LeftButton != MouseButtonState.Pressed) return;
-            if (pendingGestureButton.HasValue || isPanning) return;
+            if (Mouse.RightButton == MouseButtonState.Pressed) return;
+            if (pendingGestureButton.HasValue || isPanning || IsMotionCapturing) return;
 
             string? path = CurrentPath;
             if (string.IsNullOrEmpty(path)) return;

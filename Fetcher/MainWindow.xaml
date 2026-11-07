@@ -139,6 +139,10 @@
         <StackPanel x:Name="IndicatorPanel" Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="10" Visibility="Hidden">
             <!-- 圆点在这里动态生成 -->
         </StackPanel>
+            <Border x:Name="RightMotionRecordingBorder"
+                    BorderBrush="Red" BorderThickness="2"
+                    IsHitTestVisible="False"
+                    Visibility="Collapsed" />
         </Grid>
     </Grid>
 </Window>
