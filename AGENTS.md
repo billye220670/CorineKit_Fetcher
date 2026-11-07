@@ -162,9 +162,15 @@ CorineKit_Fetcher/
 ├── Fetcher/
 │   ├── Fetcher.csproj       # Project configuration
 │   ├── App.xaml             # Application entry point
-│   ├── App.xaml.cs
-│   ├── MainWindow.xaml      # Main UI window
-│   ├── MainWindow.xaml.cs   # Main window logic
+│   ├── App.xaml.cs          # Purges leftover video alias files on startup
+│   ├── MainWindow.xaml      # Main UI window (still-image layer + video layer)
+│   ├── MainWindow.xaml.cs   # Main window logic, media dispatch
+│   ├── MediaFormats.cs      # Single source of truth for supported extensions
+│   ├── GifPlayer.cs         # Frame-by-frame GIF playback (no WPF window dependency)
+│   ├── VideoSourceResolver.cs # webm -> mkv NTFS hard-link alias management
+│   ├── RandomTraversalEngine.cs # Full-coverage random traversal
+│   ├── CanvasViewState.cs   # Zoom/pan math
+│   ├── PathBreadcrumb.cs    # Breadcrumb path splitting
 │   ├── Settings.cs          # Settings management (XML serialization)
 │   ├── LanguageResources.cs # Multi-language support
 │   └── FetcherIcon.ico      # Application icon
@@ -189,6 +195,11 @@ CorineKit_Fetcher/
 1. Add case to color preset switch statements in `Settings.cs`
 2. Update `ColorPreset` range validation
 
+### Add New Media Format
+1. Add the extension to the right list in `MediaFormats.cs` (`ImageExtensions` / `VideoExtensions`); `AllExtensions` and the lookup sets derive from those, and scanning, the breadcrumb sibling menu and `Classify` all read the same list
+2. If it is a video container the legacy Media Foundation pipeline cannot resolve by extension (as with `.webm`), add it to `VideoSourceResolver.needsAlias` so a hard-linked alias is created
+3. Decoding always goes through WIC / Media Foundation — the app ships no codecs, so a new format only works where the matching OS codec pack is installed
+
 ---
 
 ## Git Workflow
@@ -202,6 +213,8 @@ CorineKit_Fetcher/
 
 ## Additional Notes
 
-- Settings are stored in `%APPDATA%/ImageViewer/settings.xml`
-- Supported image formats: .jpg, .jpeg, .png, .bmp, .gif, .tiff
+- Settings are stored in `%APPDATA%/CorineKitFetcher/settings.xml`, written atomically (temp file + replace) with the previous version kept in `settings_backup.xml`
+- The old location `%APPDATA%/ImageViewer/settings.xml` is shared with CorineKit_Gazer, whose `AppSettings` has a different property set but the same root element — reading each other's file silently resets every non-shared field to its class default. That directory is now read-only for migration purposes (gated on Fetcher-only elements such as `<CacheSize>`); never write settings there again
+- Supported media formats are declared once, in `MediaFormats.cs`: images `.jpg .jpeg .png .bmp .tif .tiff .webp`, animation `.gif`, video `.mp4 .m4v .mov .mkv .webm .avi .wmv .mpg .mpeg .3gp`
+- `.webm` needs a `.mkv` hard-link alias because WPF's `MediaElement` uses the legacy Media Foundation pipeline, which resolves byte-stream handlers by extension and has no `.webm` entry; the alias lives in a hidden per-volume directory and is purged on startup
 - Application uses `ImplicitUsings` - no manual using statements needed for common namespaces

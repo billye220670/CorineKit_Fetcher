@@ -34,6 +34,26 @@ namespace ImageSelector
         private const double PanEdgeMargin = 60;   // 平移时图片至少留在可视区的边距
         private CanvasViewState canvas = CanvasViewState.Fit;   // Scale = 1.0 即恰好适配窗口
 
+        //---------------------------媒体播放（GIF / 视频）-------------------------
+        private readonly GifPlayer gifPlayer = new GifPlayer();
+        private readonly VideoSourceResolver videoResolver = new VideoSourceResolver();
+
+        private MediaKind currentMediaKind = MediaKind.None;
+
+        // 当前媒体的固有尺寸，F 键重新适配时用它重算（视频/图片/GIF 都记在这里）
+        private Size currentMediaNaturalSize;
+
+        // 连续失败保护：整个目录都解不出来时不要闷头刷牌刷屏
+        private const int MaxConsecutiveMediaFailures = 30;
+        private int consecutiveMediaFailures;
+
+        // 缺解码器之类的提示一个会话只弹一次，否则随机浏览会被对话框连环打断
+        private bool webpHintShown;
+        private bool videoCodecHintShown;
+
+        private string? displayError;
+        private bool isVideoPaused;
+
         // 右键 / 中键手势：按下后先不判定，位移越过阈值才算 drag，否则算 click
         private MouseButton? pendingGestureButton;
         private Button? pendingGesturePathButton;     // 中键按下时命中的面包屑按钮（可能为 null）
@@ -61,11 +81,26 @@ namespace ImageSelector
             {
                 LanguageComboBox.SelectedIndex = settings.LanguageSetting;
             }
+
+            // 滚轮随机区：必须在 loaded 置位之前设，SelectionChanged 里才不会回写一次设置
+            WheelZoneComboBox.SelectedIndex = settings.WheelRandomZone == 1 ? 1 : 0;
             
-            // 窗口关闭时保存设置
+            // 窗口关闭时保存设置，并释放媒体资源（GIF 的流、webm 的 .mkv 替身）。
+            // TeardownMedia 这一步不能省，也不能挪到后面：MediaElement 是
+            // UnloadedBehavior="Manual"，WPF 不会在卸载时替我们关媒体会话，而替身是
+            // 硬链接、正被 Media Foundation 占着句柄——此时直接 File.Delete 会把 UI 线程
+            // 阻塞到句柄释放为止（实测 3MB 的 webm 卡 4182ms，先 Stop+Close 再删只要 11ms），
+            // 表现就是关窗后"未响应"。TeardownMedia → StopVideo 的顺序已经是对的。
             Closing += (s, e) => {
                 settings.Save();
+                TeardownMedia();
+                gifPlayer.Dispose();
+                videoResolver.Dispose();
             };
+
+            // GIF 逐帧推进：帧送到 RandomImage 上，尺寸在 Open 之后一次性适配
+            gifPlayer.FrameReady += GifPlayer_FrameReady;
+            gifPlayer.Failed += GifPlayer_Failed;
 
             // 窗口尺寸变化后重新收敛画布平移边界，避免图片被留在可视区外找不回来
             RootGrid.SizeChanged += (s, e) => ReclampCanvas();
@@ -80,6 +115,7 @@ namespace ImageSelector
             CacheSizeText.Foreground = new SolidColorBrush(settings.GetForegroundColorFromPresetID());
             BackgroundColor.Foreground = new SolidColorBrush(settings.GetForegroundColorFromPresetID());
             LanguageLabel.Foreground = new SolidColorBrush(settings.GetForegroundColorFromPresetID());
+            WheelZoneLabel.Foreground = new SolidColorBrush(settings.GetForegroundColorFromPresetID());
             this.Background = new SolidColorBrush(settings.GetBackgroundColorFromPresetID()); //恢复上次会话的背景色
             
         }
@@ -195,10 +231,10 @@ namespace ImageSelector
             currentDirectory = directory; // 更新当前目录
             settings.LastPath = directory; //更新设置中的LastPath
             settings.Save();
-            imageFiles = GetImageFiles(directory);
+            imageFiles = GetMediaFiles(directory);
             if (imageFiles.Any())
             {
-                traversal.Rebuild(imageFiles); // 重建遍历牌堆，必须在 LoadRandomImage 之前
+                traversal.Rebuild(imageFiles); // 重建目录调度状态，必须在 LoadRandomImage 之前
                 UpdateHintVisibility(); // 更新提示信息的可见性
                 UpdatePathButtons(directory, null); //根据当前目录更新路径按钮，并且不显示文件名
                 LoadRandomImage(); // 初始化显示随机图片
@@ -206,18 +242,22 @@ namespace ImageSelector
             }
             else
             {
-                MessageBox.Show("没有找到任何图片文件。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show(LanguageResources.GetText("NoMediaFound", settings.CurrentLanguage),
+                                LanguageResources.GetText("Notice", settings.CurrentLanguage),
+                                MessageBoxButton.OK, MessageBoxImage.Information);
             }
         }
 
-        private List<string> GetImageFiles(string directory)
+        /// <summary>
+        /// 递归收集目录下所有受支持的图片和视频。扩展名清单只在 <see cref="MediaFormats"/> 里维护一份。
+        /// </summary>
+        private List<string> GetMediaFiles(string directory)
         {
             List<string> files = new List<string>();
             try
             {
-                string[] supportedExtensions = { ".jpg", ".jpeg", ".png", ".bmp", ".gif" };
                 files.AddRange(Directory.GetFiles(directory, "*.*", SearchOption.AllDirectories)
-                                          .Where(file => supportedExtensions.Contains(Path.GetExtension(file).ToLower())));
+                                        .Where(MediaFormats.IsSupported));
             }
             catch (Exception ex)
             {
@@ -230,8 +270,8 @@ namespace ImageSelector
         {
             if (!imageFiles.Any()) return;
 
-            // 由遍历引擎发牌：一轮之内不重复、不遗漏，且相邻两次保持足够跳跃距离；
-            // 子目录按"饥饿度"轮转，深层小目录不会被大目录长期盖住。
+            // 由遍历引擎发牌：以叶子目录为单位做软避让，刚出过图的目录权重降低、随后平滑恢复；
+            // 目录内部按洗牌顺序轮换图片，不会连续回到同一目录。
             int next = traversal.Next();
             if (next < 0 || next >= imageFiles.Count)
             {
@@ -239,45 +279,46 @@ namespace ImageSelector
             }
 
             currentIndex = next;
-            DisplayImage(imageFiles[next]);
+            DisplayMedia(imageFiles[next]);
         }
 
-        private void DisplayImage(string imagePath)
+        //---------------------------媒体分发-------------------------
+        // 图片 / GIF / 视频共用同一套导航、缓存和画布变换，区别只在"画面从哪来"：
+        //   图片 —— BitmapImage 一次性解码（OnLoad，解完立刻关流）
+        //   GIF  —— GifPlayer 逐帧推进，帧写进同一个 RandomImage
+        //   视频 —— MediaElement；webm 要先经 VideoSourceResolver 换成 .mkv 替身
+        // Image 层和 MediaElement 层始终只有一层可见，RandomImage 同时承担图片和 GIF。
+
+        private void DisplayMedia(string mediaPath)
         {
-            currentImagePath = imagePath; // 更新当前图片路径
-            UpdatePathButtons(Path.GetDirectoryName(imagePath), Path.GetFileName(imagePath)); // 更新路径按钮
+            currentImagePath = mediaPath; // 更新当前媒体路径
+            UpdatePathButtons(Path.GetDirectoryName(mediaPath), Path.GetFileName(mediaPath)); // 更新路径按钮
+            UpdateCurrentIndex(mediaPath);
 
-            // 更新currentIndex以匹配当前显示的图片
-            int newIndex = imageFiles.IndexOf(imagePath);
-            if (newIndex >= 0)
+            displayError = null;
+            MediaKind kind = MediaFormats.Classify(mediaPath);
+            bool started = kind switch
             {
-                currentIndex = newIndex;
+                MediaKind.Image => DisplayStillImage(mediaPath),
+                MediaKind.Gif => DisplayGif(mediaPath),
+                MediaKind.Video => DisplayVideo(mediaPath),
+                _ => false
+            };
 
-                // 更新当前目录的起始和结束索引
-                string currentDir = Path.GetDirectoryName(imagePath);
-                if (directoryImageIndices.TryGetValue(currentDir, out var indices))
-                {
-                    currentDirStartIndex = indices.First();
-                    currentDirEndIndex = indices.Last();
-                }
+            if (!started)
+            {
+                ReportMediaFailure(mediaPath, displayError ?? "不支持的文件类型", kind);
+                return;
             }
 
-            // 显示图片
-            BitmapImage bitmap = new BitmapImage();
-            bitmap.BeginInit();
-            bitmap.UriSource = new Uri(imagePath);
-            bitmap.EndInit();
-            RandomImage.Source = bitmap;
+            consecutiveMediaFailures = 0;
 
-            // 计算适合窗口的缩放比例
-            ScaleImageToFit(bitmap);
-
-            // 换图后画布复位：上一张的放大/平移状态不应带到下一张
+            // 换媒体后画布复位：上一张的放大/平移状态不应带到下一张
             ResetCanvasTransform();
 
-            if (!viewedImages.Contains(imagePath)) // 仅在缓存中不包含当前图片时添加
+            if (!viewedImages.Contains(mediaPath)) // 仅在缓存中不包含当前媒体时添加
             {
-                CacheImage(imagePath);
+                CacheImage(mediaPath);
             }
 
             UpdateIndicator();
@@ -288,9 +329,262 @@ namespace ImageSelector
             }
         }
 
-        // 参数用 BitmapSource（BitmapImage 的基类），这样 F 键重新适配时
-        // 可以直接把 RandomImage.Source 传进来
-        private void ScaleImageToFit(BitmapSource bitmap)
+        /// <summary>把 currentIndex 以及"当前子目录的索引区间"对齐到指定文件。</summary>
+        private void UpdateCurrentIndex(string mediaPath)
+        {
+            int newIndex = imageFiles.IndexOf(mediaPath);
+            if (newIndex < 0) return;
+
+            currentIndex = newIndex;
+
+            string? currentDir = Path.GetDirectoryName(mediaPath);
+            if (currentDir != null && directoryImageIndices.TryGetValue(currentDir, out var indices))
+            {
+                currentDirStartIndex = indices.First();
+                currentDirEndIndex = indices.Last();
+            }
+        }
+
+        private bool DisplayStillImage(string path)
+        {
+            try
+            {
+                BitmapImage bitmap = new BitmapImage();
+                bitmap.BeginInit();
+                // OnLoad：EndInit 内就把整张图解码进内存，之后不再需要文件句柄。
+                // 之前用默认的 OnDemand，BitmapImage 会一直把文件锁到 GC 收走为止
+                // （实测：引用还活着时既不可写也不可改名），用户想在资源管理器里
+                // 挪走当前这张图就会被拒绝。OnLoad + Freeze 实测两者都放行。
+                bitmap.CacheOption = BitmapCacheOption.OnLoad;
+                bitmap.UriSource = new Uri(path);
+                bitmap.EndInit();
+                bitmap.Freeze(); // 彻底断开与流的联系，顺带允许跨线程复用
+
+                // 解码成功之后才拆旧的，失败时至少还能留着上一张
+                TeardownMedia();
+                currentMediaKind = MediaKind.Image;
+                RandomImage.Visibility = Visibility.Visible;
+                RandomImage.Source = bitmap;
+
+                currentMediaNaturalSize = new Size(bitmap.Width, bitmap.Height);
+                FitMediaToView(bitmap.Width, bitmap.Height);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                displayError = ex.Message;
+                return false;
+            }
+        }
+
+        private bool DisplayGif(string path)
+        {
+            TeardownMedia();
+
+            // 先置位再 Open：Open 内部会同步送出首帧，FrameReady 靠这个标记判断该不该接收
+            currentMediaKind = MediaKind.Gif;
+            RandomImage.Visibility = Visibility.Visible;
+
+            if (!gifPlayer.Open(path))
+            {
+                currentMediaKind = MediaKind.None;
+                displayError = gifPlayer.LastError ?? "GIF 解码失败";
+                return false;
+            }
+
+            // 尺寸只在开图时按 GIF 画布适配一次：每帧画布尺寸都一样，
+            // 逐帧重设 Width/Height 只会白白触发一轮布局。
+            currentMediaNaturalSize = new Size(gifPlayer.PixelWidth, gifPlayer.PixelHeight);
+            FitMediaToView(gifPlayer.PixelWidth, gifPlayer.PixelHeight);
+            return true;
+        }
+
+        private void GifPlayer_FrameReady(BitmapSource frame)
+        {
+            // 拆媒体时 currentMediaKind 已经不是 Gif，此时必须忽略：
+            // OnDemand 的帧随流关闭一起失效，挂回可视树会在下次渲染时抛异常。
+            if (currentMediaKind != MediaKind.Gif) return;
+            RandomImage.Source = frame;
+        }
+
+        private void GifPlayer_Failed(string reason)
+        {
+            // 播放中途出错（文件被截断、磁盘掉线等）。已经切走的话就不要误伤当前媒体。
+            if (currentMediaKind != MediaKind.Gif) return;
+            ReportMediaFailure(currentImagePath, reason, MediaKind.Gif);
+        }
+
+        private bool DisplayVideo(string path)
+        {
+            TeardownMedia();
+
+            // webm 要先换成 .mkv 替身，Media Foundation 的老管线才认（原因见 VideoSourceResolver）。
+            // 这一步必须排在 TeardownMedia 之后：Resolve 和 StopVideo 都会释放替身，
+            // 顺序反了会把刚建好的替身又删掉。
+            string? source = videoResolver.Resolve(path);
+            if (source == null)
+            {
+                displayError = videoResolver.LastError ?? "无法准备视频文件";
+                return false;
+            }
+
+            currentMediaKind = MediaKind.Video;
+            isVideoPaused = false;
+
+            RandomImage.Visibility = Visibility.Collapsed;
+            VideoPlayer.Visibility = Visibility.Visible;
+
+            try
+            {
+                VideoPlayer.Source = new Uri(source);
+                VideoPlayer.Play();
+            }
+            catch (Exception ex)
+            {
+                currentMediaKind = MediaKind.None;
+                displayError = ex.Message;
+                return false;
+            }
+
+            // 固有尺寸要等 MediaOpened 才知道，先留空，届时再适配一次
+            currentMediaNaturalSize = Size.Empty;
+            return true;
+        }
+
+        private void VideoPlayer_MediaOpened(object sender, RoutedEventArgs e)
+        {
+            int width = VideoPlayer.NaturalVideoWidth;
+            int height = VideoPlayer.NaturalVideoHeight;
+            if (width <= 0 || height <= 0) return;
+
+            currentMediaNaturalSize = new Size(width, height);
+            FitMediaToView(width, height);
+            // 布局尺寸变了，画布平移的合法区间也要跟着重新收敛
+            ReclampCanvas();
+        }
+
+        private void VideoPlayer_MediaFailed(object sender, ExceptionRoutedEventArgs e)
+        {
+            if (currentMediaKind != MediaKind.Video) return;
+
+            string reason = e.ErrorException?.Message ?? "未知播放错误";
+            // 走到这里通常是系统缺对应解码器（VP9 / AV1 / HEVC 扩展等），
+            // 也可能是替身建成功了但容器里的编码本身不受支持。
+            ReportMediaFailure(currentImagePath, reason, MediaKind.Video);
+        }
+
+        private void VideoPlayer_MediaEnded(object sender, RoutedEventArgs e)
+        {
+            // 循环播放：随机浏览的场景下停在最后一帧黑屏上没有意义。
+            // 必须 Stop 再 Play —— 播放中直接改 Position 是不生效的。
+            if (currentMediaKind != MediaKind.Video || isVideoPaused) return;
+            VideoPlayer.Stop();
+            VideoPlayer.Play();
+        }
+
+        /// <summary>
+        /// 拆掉当前正在显示 / 播放的媒体，回到"两层都空"的干净状态。
+        /// 顺序有讲究：先清空 currentMediaKind，GIF 的 FrameReady 才会忽略停播过程送来的帧；
+        /// 紧接着必须清空 Image.Source，OnDemand 的帧在流关闭后不能再渲染。
+        /// </summary>
+        private void TeardownMedia()
+        {
+            currentMediaKind = MediaKind.None;
+
+            gifPlayer.Stop();
+            RandomImage.Source = null;
+
+            StopVideo();
+
+            // 两层一起收起来，再由接下来的 Display* 点亮自己那一层。
+            // 这步不能省：MediaElement 的 Source 置空后仍会渲染一块黑底，
+            // 从视频切回图片时不折叠它就会把图盖住。
+            RandomImage.Visibility = Visibility.Collapsed;
+            VideoPlayer.Visibility = Visibility.Collapsed;
+        }
+
+        private void StopVideo()
+        {
+            if (VideoPlayer.Source == null && !videoResolver.HasAlias) return;
+
+            try
+            {
+                VideoPlayer.Stop();
+                VideoPlayer.Close();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error stopping video: {ex.Message}");
+            }
+            VideoPlayer.Source = null;
+
+            // 替身是硬链接，删掉只是减一次引用计数，动不到源文件。
+            // 必须排在 Close 之后，否则文件还被 Media Foundation 占着，删不掉。
+            videoResolver.Release();
+        }
+
+        /// <summary>
+        /// 一个文件放不出来时的统一处理：记日志、按需提示一次原因、然后换下一个。
+        /// 不逐个弹错误框 —— 随机浏览时每弹一次都要用户点一下，几十张坏图能把人逼疯。
+        /// </summary>
+        private void ReportMediaFailure(string mediaPath, string reason, MediaKind kind)
+        {
+            Console.WriteLine($"Error displaying {mediaPath}: {reason}");
+            ShowFormatHintOnce(kind, mediaPath);
+
+            if (++consecutiveMediaFailures >= MaxConsecutiveMediaFailures)
+            {
+                // 连着这么多个都放不出来，基本可以断定这个目录缺解码器，停下来告诉用户
+                consecutiveMediaFailures = 0;
+                MessageBox.Show(LanguageResources.GetText("TooManyMediaFailures", settings.CurrentLanguage),
+                                LanguageResources.GetText("Notice", settings.CurrentLanguage),
+                                MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            // 换下一个：由遍历引擎发牌，一轮之内不重复，所以不会在同一个坏文件上打转
+            LoadRandomImage();
+        }
+
+        /// <summary>缺解码器的提示一个会话只弹一次，之后同类文件安静跳过。</summary>
+        private void ShowFormatHintOnce(MediaKind kind, string mediaPath)
+        {
+            string key;
+            if (kind == MediaKind.Video)
+            {
+                if (videoCodecHintShown) return;
+                videoCodecHintShown = true;
+                key = "VideoCodecMissing";
+            }
+            else if (MediaFormats.ExtensionOf(mediaPath) == ".webp")
+            {
+                // webp 靠商店扩展 Microsoft.WebpImageExtension 提供的 WIC 解码器，
+                // 没装的机器上每张都会解码失败，所以专门提示一次去哪儿装。
+                if (webpHintShown) return;
+                webpHintShown = true;
+                key = "WebpCodecMissing";
+            }
+            else
+            {
+                return;
+            }
+
+            MessageBox.Show(LanguageResources.GetText(key, settings.CurrentLanguage),
+                            LanguageResources.GetText("Notice", settings.CurrentLanguage),
+                            MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+
+        /// <summary>
+        /// 当前该往哪一层写画面。图片和 GIF 共用 RandomImage，视频走 VideoPlayer。
+        /// </summary>
+        private FrameworkElement ActiveMediaElement =>
+            currentMediaKind == MediaKind.Video ? VideoPlayer : RandomImage;
+
+        /// <summary>
+        /// 按固有尺寸把当前媒体缩放到"恰好适配窗口"，也就是画布 Scale = 1 的基准。
+        /// 图片传 BitmapImage.Width/Height（DIP，含 DPI 换算），GIF 和视频传像素尺寸。
+        /// </summary>
+        private void FitMediaToView(double mediaWidth, double mediaHeight)
         {
             // 用客户区（RootGrid）尺寸而非窗口外框尺寸：外框含标题栏和边框，
             // 拿它算 fit 会让图片略微溢出，同时导致画布缩放锚点的居中原点算偏。
@@ -303,29 +597,23 @@ namespace ImageSelector
                 viewHeight = this.ActualHeight;
             }
 
-            // 获取图片的原始尺寸
-            double imageWidth = bitmap.Width;
-            double imageHeight = bitmap.Height;
-            if (imageWidth <= 0 || imageHeight <= 0 || viewWidth <= 0 || viewHeight <= 0) return;
+            if (mediaWidth <= 0 || mediaHeight <= 0 || viewWidth <= 0 || viewHeight <= 0) return;
 
-            // 计算宽高比例
-            double widthScale = viewWidth / imageWidth;
-            double heightScale = viewHeight / imageHeight;
-            double scale = Math.Min(widthScale, heightScale); // 选择最小的缩放比例以保持纵横比
+            double scale = Math.Min(viewWidth / mediaWidth, viewHeight / mediaHeight); // 取小的以保持纵横比
 
-            // 设置 Image 控件的尺寸
-            RandomImage.Width = imageWidth * scale; 
-            RandomImage.Height = imageHeight * scale;
+            FrameworkElement target = ActiveMediaElement;
+            target.Width = mediaWidth * scale;
+            target.Height = mediaHeight * scale;
         }
-        // 双击图片：使用系统默认方式打开图片
+
+        // 双击图片 / 视频：使用系统默认程序打开
         // 中键与右键已交给 Window 层的画布手势统一处理，这里只认左键
-        private void RandomImage_MouseDown(object sender, MouseButtonEventArgs e)
+        private void Media_MouseDown(object sender, MouseButtonEventArgs e)
         {
             if (e.ChangedButton != MouseButton.Left) return;
 
             if ((DateTime.Now - lastClickTime).TotalMilliseconds <= doubleClickInterval)
             {
-                // 执行打开图片的逻辑
                 OpenImage(currentImagePath);
             }
             lastClickTime = DateTime.Now;
@@ -341,7 +629,7 @@ namespace ImageSelector
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show("无法打开图片: " + ex.Message, "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                    MessageBox.Show("无法打开文件: " + ex.Message, "错误", MessageBoxButton.OK, MessageBoxImage.Error);
                 }
             }
         }
@@ -497,24 +785,24 @@ namespace ImageSelector
                 return new List<string>(); // 返回一个空列表
             }
 
-            // 获取同级目录，同时检查是否含有图片
+            // 获取同级目录，同时检查是否含有可显示的媒体
             var siblings = Directory.GetDirectories(parentDirectory)
-                .Where(dir => dir != currentDir && ContainsImages(dir)) // 排除当前目录并检查图片
+                .Where(dir => dir != currentDir && ContainsMedia(dir)) // 排除当前目录并检查媒体
                 .ToList();
 
             return siblings;
         }
-        // 检查目录下是否包含图片文件
-        private bool ContainsImages(string directoryPath)
+
+        /// <summary>
+        /// 检查目录下（不递归）是否含有受支持的媒体文件。
+        /// 扩展名清单与扫描逻辑共用 <see cref="MediaFormats"/>：之前两处各写了一份且不一致
+        /// （.tiff 只在这里有），导致右键菜单会列出含 tiff 的文件夹、点进去却说找不到图片。
+        /// </summary>
+        private bool ContainsMedia(string directoryPath)
         {
-            // 定义允许的图片扩展名
-            var imageExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff" };
-    
             try
             {
-                // 获取目录中的所有文件，检查是否有图片
-                return Directory.GetFiles(directoryPath)
-                    .Any(file => imageExtensions.Contains(Path.GetExtension(file).ToLower()));
+                return Directory.GetFiles(directoryPath).Any(MediaFormats.IsSupported);
             }
             catch (UnauthorizedAccessException)
             {
@@ -538,7 +826,7 @@ namespace ImageSelector
             switch (e.Key)
             {
                 case Key.Left:
-                    ShowPreviousImage(); // ���方向键
+                    ShowPreviousImage(); // 左方向键
                     break;
                 case Key.Right:
                     ShowNextImage(); // 右方向键
@@ -555,14 +843,35 @@ namespace ImageSelector
                 case Key.F:
                     RefitCanvas(); // F 键：重新适配窗口并复位画布
                     break;
+                case Key.P:
+                    TogglePlayback(); // P 键：GIF / 视频 播放暂停
+                    break;
                 case Key.Tab:
                     ToggleSettingsPanel(); // Tab 键
                     break;
             }
         }
 
+        /// <summary>P 键：暂停 / 继续当前 GIF 或视频。静态图片上是空操作。</summary>
+        private void TogglePlayback()
+        {
+            switch (currentMediaKind)
+            {
+                case MediaKind.Gif:
+                    gifPlayer.TogglePause();
+                    break;
+                case MediaKind.Video:
+                    // CanPause 只有在 MediaOpened 之后才有意义，靠 currentMediaKind 挡在前面
+                    if (!VideoPlayer.CanPause) break;
+                    if (isVideoPaused) VideoPlayer.Play();
+                    else VideoPlayer.Pause();
+                    isVideoPaused = !isVideoPaused;
+                    break;
+            }
+        }
+
         //---------------------------画布：缩放与平移-------------------------
-        // 缩放基准是 ScaleImageToFit 算出的"适配窗口"尺寸，canvas.Scale = 1.0 即适配状态。
+        // 缩放基准是 FitMediaToView 算出的"适配窗口"尺寸，canvas.Scale = 1.0 即适配状态。
         // 全部数学运算都在 CanvasViewState 里，这里只负责取布局信息和把结果写回 RenderTransform。
 
         private void ApplyCanvasTransform()
@@ -571,6 +880,13 @@ namespace ImageSelector
             CanvasScaleTransform.ScaleY = canvas.Scale;
             CanvasTranslateTransform.X = canvas.OffsetX;
             CanvasTranslateTransform.Y = canvas.OffsetY;
+
+            // 视频层有自己的一份 Transform（两个元素共用同一个未冻结的 Freezable 容易踩
+            // 继承上下文的坑），所以同样的值再写一遍。隐藏的那层写了也不渲染，不亏。
+            VideoScaleTransform.ScaleX = canvas.Scale;
+            VideoScaleTransform.ScaleY = canvas.Scale;
+            VideoTranslateTransform.X = canvas.OffsetX;
+            VideoTranslateTransform.Y = canvas.OffsetY;
         }
 
         private void ResetCanvasTransform()
@@ -580,28 +896,30 @@ namespace ImageSelector
         }
 
         /// <summary>
-        /// 重新适配窗口并复位画布（F 键）。
-        /// 只复位 transform 是不够的：图片只在换图时才做适配，窗口被拉伸过之后
+        /// 重新适配窗口并复位画布（F 键 / 右键原地单击）。
+        /// 只复位 transform 是不够的：媒体只在切换时才做适配，窗口被拉伸过之后
         /// scale=1 已经不再等于"贴合窗口"，所以要按当前尺寸重算一次。
+        /// 尺寸取自 currentMediaNaturalSize，图片 / GIF / 视频三条路都覆盖。
         /// </summary>
         private void RefitCanvas()
         {
-            if (RandomImage.Source is BitmapSource source)
+            if (currentMediaNaturalSize.Width > 0 && currentMediaNaturalSize.Height > 0)
             {
-                ScaleImageToFit(source);
+                FitMediaToView(currentMediaNaturalSize.Width, currentMediaNaturalSize.Height);
             }
             ResetCanvasTransform();
         }
 
         /// <summary>
-        /// 取图片布局尺寸（不受 RenderTransform 影响），用于换算缩放锚点与平移边界。
+        /// 取当前媒体的布局尺寸（不受 RenderTransform 影响），用于换算缩放锚点与平移边界。
         /// </summary>
         private Size GetImageLayoutSize()
         {
-            double w = RandomImage.ActualWidth;
-            double h = RandomImage.ActualHeight;
-            if (double.IsNaN(w) || w <= 0) w = RandomImage.Width;
-            if (double.IsNaN(h) || h <= 0) h = RandomImage.Height;
+            FrameworkElement target = ActiveMediaElement;
+            double w = target.ActualWidth;
+            double h = target.ActualHeight;
+            if (double.IsNaN(w) || w <= 0) w = target.Width;
+            if (double.IsNaN(h) || h <= 0) h = target.Height;
             if (double.IsNaN(w) || w < 0) w = 0;
             if (double.IsNaN(h) || h < 0) h = 0;
             return new Size(w, h);
@@ -667,14 +985,12 @@ namespace ImageSelector
 
         private void Window_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
         {
-            Point mouseInGrid = e.GetPosition(RootGrid);
-
             // 缩放的唯一入口：右键按住 + 滚轮。
             // 不能只看 e.RightButton 是否按下：右键点在面包屑上会弹同级目录菜单，
             // 那种情况下滚轮不该变成缩放。
             if (pendingGestureButton == MouseButton.Right)
             {
-                ZoomCanvasAt(mouseInGrid, CanvasViewState.WheelToFactor(e.Delta));
+                ZoomCanvasAt(e.GetPosition(RootGrid), CanvasViewState.WheelToFactor(e.Delta));
                 e.Handled = true;
                 return;
             }
@@ -686,23 +1002,34 @@ namespace ImageSelector
                 return;
             }
 
-            // 其余情况滚轮只切图，不缩放：窗口纵向对半分，
-            // 上半 = 顺序切图（↑/↓ 那套），下半 = 缓存切图（←/→ 那套）
-            if (RandomImage.Source == null || RootGrid.ActualHeight <= 0)
+            DependencyObject? source = e.OriginalSource as DependencyObject;
+
+            // 悬停在展开的设置面板上时不接管滚轮，交给面板里的 Slider / ComboBox 自己滚。
+            // 面板收起时是 Collapsed，命中不到，所以下面的分区判断不受影响。
+            if (IsDescendantOf(source, SettingsPanel)) return;
+
+            if (currentMediaKind == MediaKind.None)
             {
                 e.Handled = true;
                 return;
             }
 
-            if (mouseInGrid.Y < RootGrid.ActualHeight / 2)
-            {
-                if (e.Delta > 0) showPreviousImageInOrder();
-                else if (e.Delta < 0) showNextImageInOrder();
-            }
-            else
+            // 滚轮按悬停位置分两区：面包屑 / 其余区域，哪一区是随机切由设置决定，
+            // 另一区就是顺序切（↑/↓ 那套）
+            bool onBreadcrumb = IsDescendantOf(source, PathButtonPanel);
+            bool randomZone = onBreadcrumb
+                ? settings.WheelRandomZone == 0
+                : settings.WheelRandomZone == 1;
+
+            if (randomZone)
             {
                 if (e.Delta > 0) ShowPreviousImage();
                 else if (e.Delta < 0) ShowNextImage();
+            }
+            else
+            {
+                if (e.Delta > 0) showPreviousImageInOrder();
+                else if (e.Delta < 0) showNextImageInOrder();
             }
             e.Handled = true;
         }
@@ -904,7 +1231,7 @@ namespace ImageSelector
             {
                 currentIndex = currentDirStartIndex;
             }
-            DisplayImage(imageFiles[currentIndex]);
+            DisplayMedia(imageFiles[currentIndex]);
         }
         private void showPreviousImageInOrder()
         {
@@ -918,7 +1245,7 @@ namespace ImageSelector
             {
                 currentIndex = currentDirEndIndex;
             }
-            DisplayImage(imageFiles[currentIndex]);
+            DisplayMedia(imageFiles[currentIndex]);
         }
         private void ShowPreviousImage()
         {
@@ -926,7 +1253,7 @@ namespace ImageSelector
             if (viewedIndex > 0)
             {
                 viewedIndex--; // 移动到缓存中的上一张
-                DisplayImage(viewedImages[viewedIndex]);
+                DisplayMedia(viewedImages[viewedIndex]);
             }
         }
 
@@ -936,7 +1263,7 @@ namespace ImageSelector
             if (viewedIndex < viewedImages.Count - 1)
             {
                 viewedIndex++; // 移动到缓存中的下一张
-                DisplayImage(viewedImages[viewedIndex]);
+                DisplayMedia(viewedImages[viewedIndex]);
             }
             else
             {
@@ -1008,6 +1335,9 @@ namespace ImageSelector
             CacheSizeText.Text = LanguageResources.GetText("CacheSize", language)+ settings.CacheSize.ToString();
             BackgroundColor.Text = LanguageResources.GetText("BackgroundColor", language);
             LanguageLabel.Text = LanguageResources.GetText("Language", language);
+            WheelZoneLabel.Text = LanguageResources.GetText("WheelRandomZone", language);
+            SetComboItemText(WheelZoneComboBox, 0, "WheelZoneBreadcrumb", language);
+            SetComboItemText(WheelZoneComboBox, 1, "WheelZoneElsewhere", language);
             
             // 只有当已经加载了图片且currentImagePath不为空时，才更新路径按钮
             if (IsLoaded && !string.IsNullOrEmpty(currentImagePath))
@@ -1042,16 +1372,40 @@ namespace ImageSelector
         // 处理语言下拉列表的选择变化
         private void LanguageComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
+            // 构造函数里设 SelectedIndex 也会触发到这里，而界面语言那时已由 UpdateUILanguage
+            // 单独刷过了；不挡住的话每次启动都会白存一次盘，万一 Load 读到的是别的程序
+            // 留下的文件，还会把默认值直接写死到磁盘上。
+            if (settings == null || !loaded) return;
+
             if (sender is ComboBox comboBox && comboBox.SelectedItem is ComboBoxItem selectedItem)
             {
                 if (int.TryParse(selectedItem.Tag.ToString(), out int languageIndex))
                 {
-                    // 更���语言设置
+                    // 更新语言设置
                     settings.SetLanguage(languageIndex);
                     
                     // 更新界面语言
                     UpdateUILanguage(settings.CurrentLanguage);
                 }
+            }
+        }
+
+        // 滚轮随机区下拉：选完立即落盘，滚轮逻辑直接读 settings.WheelRandomZone
+        private void WheelZoneComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (settings == null || !loaded) return;
+            if (sender is ComboBox comboBox && comboBox.SelectedItem is ComboBoxItem selectedItem
+                && int.TryParse(selectedItem.Tag?.ToString(), out int zone))
+            {
+                settings.SetWheelRandomZone(zone);
+            }
+        }
+
+        private static void SetComboItemText(ComboBox comboBox, int index, string key, Language language)
+        {
+            if (comboBox.Items.Count > index && comboBox.Items[index] is ComboBoxItem item)
+            {
+                item.Content = LanguageResources.GetText(key, language);
             }
         }
     }

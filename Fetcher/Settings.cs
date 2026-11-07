@@ -16,7 +16,10 @@ namespace ImageSelector
         
         // 添加语言设置属性
         public int LanguageSetting { get; set; } = 2; // 默认为日语 (索引2)
-        
+
+        // 滚轮的随机区：0 = 悬停面包屑时随机（其余区域顺序），1 = 悬停其余区域时随机（面包屑顺序）
+        public int WheelRandomZone { get; set; } = 0;
+
         // 获取当前语言
         public Language CurrentLanguage => (Language)LanguageSetting;
 
@@ -35,6 +38,13 @@ namespace ImageSelector
         public void SetLanguage(int languageIndex)
         {
             LanguageSetting = languageIndex;
+            Save();
+        }
+
+        // 设置滚轮的随机区
+        public void SetWheelRandomZone(int zone)
+        {
+            WheelRandomZone = zone;
             Save();
         }
         
@@ -119,23 +129,34 @@ namespace ImageSelector
             BackgroundColorB = color.B;
         }
         
-        private static string SettingsPath => Path.Combine(
+        private static string SettingsDirectory => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "ImageViewer",
-            "settings.xml");
+            "CorineKitFetcher");
 
-        private static string BackupPath => Path.Combine(
+        private static string SettingsPath => Path.Combine(SettingsDirectory, "settings.xml");
+
+        private static string BackupPath => Path.Combine(SettingsDirectory, "settings_backup.xml");
+
+        // 旧版本把设置存在 %APPDATA%\ImageViewer，那是和 CorineKit_Gazer 共用的目录，
+        // 两边的根元素都叫 <AppSettings>。XmlSerializer 对不认识的元素静默忽略、对缺失的
+        // 元素填类初始值，所以 Gazer 存一次盘，Fetcher 的主题色 / 语言 / 上次路径就全变回
+        // 默认，而且不抛异常——只在反序列化失败时才回退备份的逻辑因此永远不会触发。
+        // 现在搬到独立目录，旧目录只做一次只读迁移，不写也不删（那还是 Gazer 的文件）。
+        private static string LegacyDirectory => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "ImageViewer",
-            "settings_backup.xml");
+            "ImageViewer");
+
+        // 只有 Fetcher 才有的元素名，用来辨认旧文件到底是谁写的
+        private static readonly string[] OwnerMarkers =
+        {
+            "<LastPath>", "<ColorPreset>", "<CacheSize>", "<LanguageSetting>", "<WheelRandomZone>"
+        };
 
         public void Save()
         {
             try
             {
-                string directory = Path.GetDirectoryName(SettingsPath);
-                if (!Directory.Exists(directory))
-                    Directory.CreateDirectory(directory);
+                Directory.CreateDirectory(SettingsDirectory);
 
                 if (File.Exists(SettingsPath))
                 {
@@ -146,11 +167,15 @@ namespace ImageSelector
                     catch { }
                 }
 
+                // 先写临时文件再整份替换。FileMode.Create 会立刻把目标截断成 0 字节，
+                // 进程在这中间被结束就会留下半个 XML。
+                string tempPath = SettingsPath + ".tmp";
                 XmlSerializer serializer = new XmlSerializer(typeof(AppSettings));
-                using (FileStream stream = new FileStream(SettingsPath, FileMode.Create))
+                using (FileStream stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
                 {
                     serializer.Serialize(stream, this);
                 }
+                File.Move(tempPath, SettingsPath, true);
             }
             catch (Exception ex)
             {
@@ -162,29 +187,68 @@ namespace ImageSelector
         {
             if (!File.Exists(SettingsPath))
             {
-                if (File.Exists(BackupPath))
-                {
-                    return LoadFromFile(BackupPath);
-                }
-                return new AppSettings();
+                return MigrateFromLegacyDirectory() ?? new AppSettings();
             }
 
-            var result = LoadFromFile(SettingsPath);
+            AppSettings? result = LoadFromFile(SettingsPath);
             if (result == null && File.Exists(BackupPath))
             {
-                return LoadFromFile(BackupPath);
+                result = LoadFromFile(BackupPath);
             }
             return result ?? new AppSettings();
         }
 
-        private static AppSettings LoadFromFile(string path)
+        private static AppSettings? MigrateFromLegacyDirectory()
+        {
+            string[] legacyPaths =
+            {
+                Path.Combine(LegacyDirectory, "settings.xml"),
+                Path.Combine(LegacyDirectory, "settings_backup.xml")
+            };
+
+            foreach (string legacyPath in legacyPaths)
+            {
+                if (!LooksLikeFetcherSettings(legacyPath)) continue;
+
+                AppSettings? migrated = LoadFromFile(legacyPath);
+                if (migrated == null) continue;
+
+                // 立刻落盘：旧目录仍然归 Gazer 写，等到关窗再存就可能已经被它覆盖掉了。
+                migrated.Save();
+                return migrated;
+            }
+
+            return null;
+        }
+
+        private static bool LooksLikeFetcherSettings(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return false;
+
+                string content = File.ReadAllText(path);
+                foreach (string marker in OwnerMarkers)
+                {
+                    if (content.Contains(marker)) return true;
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error inspecting legacy settings {path}: {ex.Message}");
+                return false;
+            }
+        }
+
+        private static AppSettings? LoadFromFile(string path)
         {
             try
             {
                 XmlSerializer serializer = new XmlSerializer(typeof(AppSettings));
                 using (FileStream stream = new FileStream(path, FileMode.Open))
                 {
-                    return (AppSettings)serializer.Deserialize(stream);
+                    return serializer.Deserialize(stream) as AppSettings;
                 }
             }
             catch (Exception ex)

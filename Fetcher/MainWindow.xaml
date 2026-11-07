@@ -24,7 +24,7 @@
                HorizontalAlignment="Stretch"
                VerticalAlignment="Stretch" 
                RenderTransformOrigin="0,0"
-               MouseDown="RandomImage_MouseDown"
+               MouseDown="Media_MouseDown"
                MouseMove="Window_MouseMove">
             <!-- 画布变换：先缩放后平移，即 屏幕点 = 布局点 * Scale + Translate。
                  RenderTransformOrigin 必须是 0,0，缩放锚点由代码按鼠标位置换算。 -->
@@ -35,6 +35,34 @@
                 </TransformGroup>
             </Image.RenderTransform>
         </Image>
+
+        <!-- 视频层。和图片同一套画布变换（各自一份 Transform，由 ApplyCanvasTransform 同步写入，
+             避免两个元素共用同一个未冻结 Freezable）。
+             LoadedBehavior=Manual 才能用代码 Play/Pause/Stop；默认 Play 会一挂上 Source 就自动播且禁止 Stop。
+             MediaElement 走的是 WPF 合成树（不是 HwndHost），所以面包屑和圆点指示器能正常盖在它上面。
+             一律静音：这是随机看图工具，视频只是顺带看的，不需要出声，也避免一开就炸响。 -->
+        <MediaElement x:Name="VideoPlayer"
+                      HorizontalAlignment="Stretch"
+                      VerticalAlignment="Stretch"
+                      IsMuted="True"
+                      RenderTransformOrigin="0,0"
+                      Visibility="Collapsed"
+                      Stretch="Uniform"
+                      ScrubbingEnabled="False"
+                      LoadedBehavior="Manual"
+                      UnloadedBehavior="Manual"
+                      MediaOpened="VideoPlayer_MediaOpened"
+                      MediaFailed="VideoPlayer_MediaFailed"
+                      MediaEnded="VideoPlayer_MediaEnded"
+                      MouseDown="Media_MouseDown"
+                      MouseMove="Window_MouseMove">
+            <MediaElement.RenderTransform>
+                <TransformGroup>
+                    <ScaleTransform x:Name="VideoScaleTransform" ScaleX="1" ScaleY="1" />
+                    <TranslateTransform x:Name="VideoTranslateTransform" X="0" Y="0" />
+                </TransformGroup>
+            </MediaElement.RenderTransform>
+        </MediaElement>
         <StackPanel x:Name="SettingsPanel" Visibility="Collapsed" Background="#F9F9F9" 
                     HorizontalAlignment="Right" Width="200" Margin="0">
             <TextBlock Name= "SettingTittle" Text="設定" Margin="15" FontWeight="Bold" />
@@ -68,6 +96,13 @@
                 <ComboBoxItem Content="中文" Tag="0"/>
                 <ComboBoxItem Content="English" Tag="1"/>
                 <ComboBoxItem Content="日本語" Tag="2"/>
+            </ComboBox>
+
+            <!-- 滚轮随机区：决定"悬停面包屑"和"悬停其余区域"哪一边是随机切图 -->
+            <TextBlock Name="WheelZoneLabel" Text="ホイールランダム域:" Margin="15" />
+            <ComboBox x:Name="WheelZoneComboBox" Margin="15,0,15,15" Focusable="false" SelectionChanged="WheelZoneComboBox_SelectionChanged">
+                <ComboBoxItem Content="パスバー上" Tag="0"/>
+                <ComboBoxItem Content="その他の領域" Tag="1"/>
             </ComboBox>
         </StackPanel>
         <Canvas Name="MyCanvas">
